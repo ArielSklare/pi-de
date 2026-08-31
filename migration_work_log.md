@@ -38,3 +38,17 @@ Started: 2026-08-31T11:20:00+03:00
 - Files changed: README.md, lua/custom/plugins/pi.lua, lua/custom/plugins/setup.lua, lua/custom/plugins/toggleterm.lua, migration_work_log.md
 - Git commit: aa3b3a2
 - Timestamp: 2026-08-31T11:45:00+03:00
+
+---
+
+## Task: Switch Neovim theme to Catppuccin Frappé
+Started: 2026-08-31T15:18:00+03:00
+
+---
+
+## Step 1: Switch Neovim theme
+- Status: ✅ Complete
+- Summary: Replaced Tokyo Night with Catppuccin, configured the Frappé flavour, preserved non-italic styling, updated the native package lock, and removed the obsolete Tokyo Night package. Headless Neovim reported `catppuccin-frappe` as the active colorscheme.
+- Files changed: init.lua, nvim-pack-lock.json, migration_work_log.md
+- Git commit: pending
+- Timestamp: 2026-08-31T15:20:17+03:00
