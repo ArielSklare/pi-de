@@ -50,5 +50,5 @@ Started: 2026-08-31T15:18:00+03:00
 - Status: ✅ Complete
 - Summary: Replaced Tokyo Night with Catppuccin, configured the Frappé flavour, preserved non-italic styling, updated the native package lock, and removed the obsolete Tokyo Night package. Headless Neovim reported `catppuccin-frappe` as the active colorscheme.
 - Files changed: init.lua, nvim-pack-lock.json, migration_work_log.md
-- Git commit: pending
+- Git commit: efaaacb
 - Timestamp: 2026-08-31T15:20:17+03:00
