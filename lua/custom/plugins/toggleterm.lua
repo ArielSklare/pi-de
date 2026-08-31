@@ -31,16 +31,20 @@ toggleterm.setup{
 
 -- Function to open a Pi terminal using the selected setup profile. Pi's default
 -- profile reads credentials and the default model from ~/.pi/agent automatically.
+local pi_term
 function _G.pi_open_term()
-  local ToggleTerm = require('toggleterm.terminal')
+  local Terminal = require('toggleterm.terminal').Terminal
   local setup = require('custom.plugins.setup')
-  local command = table.concat(vim.tbl_map(vim.fn.shellescape, setup.get_pi_command()), ' ')
-  local term = ToggleTerm.get_or_create_term('pi_term', {
-    direction = 'vertical',
-    display_name = 'Pi',
-    cmd = command,
-  })
-  term:toggle()
+  if not pi_term then
+    local command = table.concat(vim.tbl_map(vim.fn.shellescape, setup.get_pi_command()), ' ')
+    pi_term = Terminal:new {
+      direction = 'vertical',
+      display_name = 'Pi',
+      cmd = command,
+      hidden = true,
+    }
+  end
+  pi_term:toggle()
 end
 
 -- Keymap to open pi terminal
