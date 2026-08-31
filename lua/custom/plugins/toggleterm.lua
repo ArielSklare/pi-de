@@ -1,5 +1,7 @@
 -- toggleterm.nvim configuration for side terminal
-vim.pack.add { 'akinsho/toggleterm.nvim', version = '*', opt = false }
+vim.pack.add {
+  { src = 'https://github.com/akinsho/toggleterm.nvim', version = vim.version.range '*' },
+}
 
 local status_ok, toggleterm = pcall(require, 'toggleterm')
 if not status_ok then
