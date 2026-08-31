@@ -15,7 +15,7 @@ A Neovim configuration based on [kickstart.nvim](https://github.com/nvim-lua/kic
   - TOML (`taplo`)
   - Groovy (`groovyls`)
 - Side terminal window running Pi agent (`<leader>tp`)
-- First-start interface to configure Pi API key and provider
+- First-start interface to reuse an existing Pi login or configure an API-key/provider override
 - Commands to request code suggestions from Pi and highlight them:
   - `:PiSuggest` – get suggestions for current buffer (or visual selection)
   - `:PiAccept` – apply all pending suggestions
@@ -31,7 +31,7 @@ Clone this repository to `~/.config/nvim` (or `~/nvim-pi-ide` and set `$MYVIMRC`
 git clone https://github.com/yourusername/nvim-pi-ide.git ~/.config/nvim
 ```
 
-Start Neovim. The first run will prompt you to enter an API key for Pi and select a provider.
+Start Neovim. On first run, choose whether to reuse the existing Pi login from `~/.pi/agent/auth.json` (recommended) or configure a separate provider/API-key override.
 
 ## Usage
 
@@ -47,7 +47,9 @@ Start Neovim. The first run will prompt you to enter an API key for Pi and selec
 
 ## Configuration
 
-Pi configuration is stored in `~/local/share/nvim/pi_config.json` (or `$XDG_DATA_HOME/nvim/pi_config.json`). You can re-run the setup by deleting this file and restarting Neovim.
+The integration profile is stored in `~/.local/share/nvim/pi_config.json` (or `$XDG_DATA_HOME/nvim/pi_config.json`) with user-only permissions. Run `:PiSetup` to change it.
+
+When **Use existing Pi login** is selected, credentials and the default model remain managed by Pi in `~/.pi/agent/auth.json` and `~/.pi/agent/settings.json`; the Neovim profile does not copy them. Use `/login` and `/model` inside Pi to change that base configuration.
 
 ## Extending
 

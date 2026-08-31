@@ -29,19 +29,18 @@ toggleterm.setup{
   shell = vim.o.shell,
 }
 
--- Function to open a pi terminal
+-- Function to open a Pi terminal using the selected setup profile. Pi's default
+-- profile reads credentials and the default model from ~/.pi/agent automatically.
 function _G.pi_open_term()
   local ToggleTerm = require('toggleterm.terminal')
-  local term = ToggleTerm.get_or_create_term('pi_term', { direction = 'vertical', display_name = 'Pi' })
-  if not term:is_open() then
-    term:open()
-    -- Send 'pi' command to start the agent
-    vim.schedule(function()
-      term:send('pi\n', false)
-    end)
-  else
-    term:toggle()
-  end
+  local setup = require('custom.plugins.setup')
+  local command = table.concat(vim.tbl_map(vim.fn.shellescape, setup.get_pi_command()), ' ')
+  local term = ToggleTerm.get_or_create_term('pi_term', {
+    direction = 'vertical',
+    display_name = 'Pi',
+    cmd = command,
+  })
+  term:toggle()
 end
 
 -- Keymap to open pi terminal
