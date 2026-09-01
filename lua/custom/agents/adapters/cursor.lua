@@ -49,11 +49,26 @@ local function tool_output(detail)
   return success.content or success.output or success.message
 end
 
+local function trim(message)
+  return tostring(message or ''):gsub('^%s+', ''):gsub('%s+$', '')
+end
+
 local function is_auth_error(message)
   local lowered = tostring(message or ''):lower()
   return lowered:find('not logged', 1, true)
-    or lowered:find('authentication', 1, true)
+    or lowered:find('not authenticated', 1, true)
+    or lowered:find('authentication required', 1, true)
+    or lowered:find('login required', 1, true)
     or lowered:find('unauthorized', 1, true)
+end
+
+local function is_protocol_incompatibility(message)
+  local lowered = tostring(message or ''):lower()
+  return lowered:find('unknown option', 1, true)
+    or lowered:find('unrecognized option', 1, true)
+    or lowered:find('unsupported option', 1, true)
+    or lowered:find('unsupported output format', 1, true)
+    or (lowered:find('stream-json', 1, true) and lowered:find('not supported', 1, true))
 end
 
 function CursorAdapter.new(options)
@@ -88,6 +103,7 @@ function CursorAdapter.new(options)
     stderr_eof = false,
     exit_code = nil,
     error_emitted = false,
+    structured_error = nil,
   }, CursorAdapter)
 end
 
@@ -113,7 +129,12 @@ function CursorAdapter:start()
   if self.started then return true, nil end
 
   local auth = self:_run({ 'status' }, self.auth_timeout)
-  if auth.code ~= 0 then return false, "Cursor is not authenticated; run 'cursor-agent login'" end
+  if auth.code ~= 0 then
+    local message = trim((auth.stderr and auth.stderr ~= '' and auth.stderr) or auth.stdout)
+    if is_auth_error(message) then return false, "Cursor is not authenticated; run 'cursor-agent login'" end
+    if message == '' then message = 'exit code ' .. tostring(auth.code) end
+    return false, 'Cursor status check failed: ' .. message
+  end
 
   local help = self:_run({ '--help' }, self.auth_timeout)
   local help_text = tostring(help.stdout or '') .. tostring(help.stderr or '')
@@ -171,6 +192,11 @@ function CursorAdapter:_emit(event)
   if not event or not self.callback then return end
   if event.kind == 'error' then
     if self.error_emitted then return end
+    local message = event.payload and event.payload.message
+    self.structured_error = message
+    if is_auth_error(message) and not tostring(message):find('cursor-agent login', 1, true) then
+      event.payload.message = trim(message) .. "; run 'cursor-agent login'"
+    end
     self.error_emitted = true
   end
   local callback = self.callback
@@ -201,17 +227,16 @@ function CursorAdapter:_drain_stdout_buffer(flush_final)
 end
 
 function CursorAdapter:_exit_message()
-  local stderr = self.stderr_buffer:gsub('^%s+', ''):gsub('%s+$', '')
-  if is_auth_error(stderr) then return "Cursor is not authenticated; run 'cursor-agent login'" end
+  local stderr = trim(self.stderr_buffer)
   return stderr ~= '' and stderr or ('Cursor exited with code ' .. tostring(self.exit_code))
 end
 
 function CursorAdapter:_maybe_finalize()
   if not self.process_exited or not self.stdout_eof or not self.stderr_eof then return end
 
-  if self.exit_code ~= 0 and not self.stopping then
+  if self.exit_code ~= 0 and not self.stopping and not self.structured_error then
     local message = self:_exit_message()
-    if not is_auth_error(message) then
+    if is_protocol_incompatibility(message) then
       local opened, reason = self:_open_fallback()
       if opened then message = message .. '; opened interactive Cursor terminal fallback'
       elseif reason then message = message .. '; terminal fallback failed: ' .. reason end
@@ -277,6 +302,7 @@ function CursorAdapter:prompt(text, callback)
   self.stderr_eof = false
   self.exit_code = nil
   self.error_emitted = false
+  self.structured_error = nil
 
   local arguments = {
     '--print', '--output-format', 'stream-json', '--stream-partial-output', '--mode', 'ask', '--', text,

@@ -344,26 +344,97 @@ assert_equal(auth_checks, 1, 'unauthenticated Codex does not retry')
 assert_equal(#auth_notifications, 0, 'authentication failure notification is manager-owned')
 
 local function decode_cursor_json(value)
-  local result = {
-    type = assert(value:match '"type":"([^"]+)"', 'missing Cursor fixture event type'),
-    subtype = value:match '"subtype":"([^"]+)"',
-    session_id = value:match '"session_id":"([^"]+)"',
-    call_id = value:match '"call_id":"([^"]+)"',
-    timestamp_ms = tonumber(value:match '"timestamp_ms":(%d+)'),
-    is_error = value:match '"is_error":true' ~= nil,
-    result = value:match '"result":"([^"]+)"',
-  }
-  local text = value:match '"content":%[%{"type":"text","text":"([^"]*)"'
-  if text then result.message = { content = { { type = 'text', text = text } } } end
-  local tool_name = value:match '"tool_call":%{"([%w_]+)":'
-  if tool_name then
-    result.tool_call = { name = tool_name }
-    if value:match '"result":' then
-      result.tool_call.result = value:match '"content":"([^"]*)"'
-      if result.tool_call.result then result.tool_call.result = result.tool_call.result:gsub('\\n', '\n') end
+  local position = 1
+
+  local function skip_space()
+    local _, last = value:find('^[ \t\r\n]*', position)
+    position = (last or position - 1) + 1
+  end
+
+  local parse_value
+  local function parse_string()
+    assert(value:sub(position, position) == '"', 'expected JSON string')
+    position = position + 1
+    local output = {}
+    while position <= #value do
+      local character = value:sub(position, position)
+      position = position + 1
+      if character == '"' then return table.concat(output) end
+      if character == '\\' then
+        local escaped = value:sub(position, position)
+        position = position + 1
+        local replacements = { ['"'] = '"', ['\\'] = '\\', ['/'] = '/', b = '\b', f = '\f', n = '\n', r = '\r', t = '\t' }
+        if escaped == 'u' then
+          local code = assert(tonumber(value:sub(position, position + 3), 16), 'invalid JSON unicode escape')
+          position = position + 4
+          table.insert(output, code < 128 and string.char(code) or '?')
+        else
+          local replacement = replacements[escaped]
+          assert(replacement, 'invalid JSON escape')
+          table.insert(output, replacement)
+        end
+      else
+        table.insert(output, character)
+      end
+    end
+    error('unterminated JSON string')
+  end
+
+  local function parse_array()
+    position = position + 1
+    local result = {}
+    skip_space()
+    if value:sub(position, position) == ']' then position = position + 1; return result end
+    while true do
+      table.insert(result, parse_value())
+      skip_space()
+      local separator = value:sub(position, position)
+      position = position + 1
+      if separator == ']' then return result end
+      assert(separator == ',', 'expected JSON array separator')
     end
   end
-  return result
+
+  local function parse_object()
+    position = position + 1
+    local result = {}
+    skip_space()
+    if value:sub(position, position) == '}' then position = position + 1; return result end
+    while true do
+      skip_space()
+      local key = parse_string()
+      skip_space()
+      assert(value:sub(position, position) == ':', 'expected JSON object colon')
+      position = position + 1
+      result[key] = parse_value()
+      skip_space()
+      local separator = value:sub(position, position)
+      position = position + 1
+      if separator == '}' then return result end
+      assert(separator == ',', 'expected JSON object separator')
+    end
+  end
+
+  function parse_value()
+    skip_space()
+    local character = value:sub(position, position)
+    if character == '"' then return parse_string() end
+    if character == '{' then return parse_object() end
+    if character == '[' then return parse_array() end
+    local literal = value:sub(position)
+    if literal:sub(1, 4) == 'true' then position = position + 4; return true end
+    if literal:sub(1, 5) == 'false' then position = position + 5; return false end
+    if literal:sub(1, 4) == 'null' then position = position + 4; return nil end
+    local number = literal:match('^-?%d+%.?%d*[eE]?[+-]?%d*')
+    assert(number and number ~= '', 'invalid JSON value')
+    position = position + #number
+    return tonumber(number)
+  end
+
+  local decoded = parse_value()
+  skip_space()
+  assert(position > #value, 'trailing JSON data')
+  return decoded
 end
 
 local cursor_fixture_lines = {}
@@ -412,12 +483,24 @@ local cursor_adapter = CursorAdapter.new {
   open_terminal = function() cursor_terminal_opens = cursor_terminal_opens + 1; return true end,
   levels = { WARN = 'WARN' },
 }
+local normalized_cursor_fixtures = {}
 local expected_cursor_kinds = { 'started', 'text_delta', 'tool_started', 'tool_output', 'completed', 'error' }
 for index, line in ipairs(cursor_fixture_lines) do
   local normalized = cursor_adapter:parse_event(decode_cursor_json(line))
   assert(normalized, 'Cursor fixture event ' .. index .. ' is normalized')
   assert_equal(normalized.kind, expected_cursor_kinds[index], 'Cursor fixture event kind ' .. index)
+  normalized_cursor_fixtures[index] = normalized
 end
+assert_equal(normalized_cursor_fixtures[1].payload.session_id, 'session-fixture', 'Cursor init session payload')
+assert_equal(normalized_cursor_fixtures[1].payload.model, 'cursor-model', 'Cursor init model payload')
+assert_equal(normalized_cursor_fixtures[2].payload.text, 'cursor fixture ready', 'Cursor text payload')
+assert_equal(normalized_cursor_fixtures[3].payload.id, 'call-fixture', 'Cursor tool start id payload')
+assert_equal(normalized_cursor_fixtures[3].payload.tool, 'read', 'Cursor tool start name payload')
+assert_equal(normalized_cursor_fixtures[3].payload.item.args.path, '/tmp/cursor-fixture/input.txt', 'Cursor tool args retain wire shape')
+assert_equal(normalized_cursor_fixtures[4].payload.tool, 'read', 'Cursor tool output name payload')
+assert_equal(normalized_cursor_fixtures[4].payload.output, 'fixture-tool-content\n', 'Cursor tool output payload')
+assert_equal(normalized_cursor_fixtures[5].payload.request_id, 'request-fixture', 'Cursor completion request payload')
+assert_equal(normalized_cursor_fixtures[6].payload.message, 'Authentication required', 'Cursor auth error payload')
 assert_equal(cursor_adapter:parse_event { type = 'thinking', subtype = 'delta' }, nil, 'Cursor thinking is ignored')
 
 local cursor_started, cursor_start_error = cursor_adapter:start()
@@ -462,6 +545,15 @@ assert(cursor_auth_error:find('cursor%-agent login'), 'unauthenticated Cursor gi
 assert_equal(cursor_auth_checks, 1, 'unauthenticated Cursor does not retry or probe the protocol')
 assert_equal(cursor_terminal_opens, 0, 'unauthenticated Cursor does not enter a fallback loop')
 
+local cursor_status_failure = CursorAdapter.new {
+  provider = providers.cursor,
+  command_runner = function() return { code = 1, stderr = 'status command timed out' } end,
+}
+local status_started, status_error = cursor_status_failure:start()
+assert_equal(status_started, false, 'failed Cursor status command fails startup')
+assert(status_error:find('status command timed out', 1, true), 'failed Cursor status command preserves its actual error')
+assert(not status_error:find('login', 1, true), 'failed Cursor status command is not labeled unauthenticated')
+
 local fallback_opens = 0
 local cursor_fallback = CursorAdapter.new {
   provider = providers.cursor,
@@ -482,6 +574,95 @@ assert_equal(fallback_opens, 1, 'Cursor incompatible protocol opens ToggleTerm o
 cursor_fallback:prompt('not retried', function(event) table.insert(cursor_events, event) end)
 assert_equal(fallback_opens, 1, 'Cursor prompt does not retry terminal fallback')
 assert_equal(cursor_events[#cursor_events].kind, 'error', 'terminal fallback reports structured prompt unavailability')
+
+local function run_cursor_exit(stdout_line, stderr, code)
+  local pipes = {}
+  local spawned
+  local terminal_opens = 0
+  local runtime_uv = {}
+  function runtime_uv.new_pipe()
+    local pipe = { closing = false }
+    function pipe:is_closing() return self.closing end
+    function pipe:close() self.closing = true end
+    table.insert(pipes, pipe)
+    return pipe
+  end
+  function runtime_uv.cwd() return '/workspace' end
+  function runtime_uv.read_start(pipe, callback) pipe.reader = callback end
+  function runtime_uv.spawn(_, _, on_exit)
+    spawned = { on_exit = on_exit }
+    local process = { closing = false }
+    function process:is_closing() return self.closing end
+    function process:close() self.closing = true end
+    function process:kill() self.closing = true end
+    return process
+  end
+
+  local adapter = CursorAdapter.new {
+    provider = providers.cursor,
+    uv = runtime_uv,
+    command_runner = cursor_command_runner,
+    json_decode = decode_cursor_json,
+    schedule = function(callback) callback() end,
+    notify = function() end,
+    open_terminal = function() terminal_opens = terminal_opens + 1; return true end,
+    levels = { WARN = 'WARN' },
+  }
+  local emitted = {}
+  adapter:prompt('failure fixture', function(event) table.insert(emitted, event) end)
+  if stdout_line then pipes[1].reader(nil, stdout_line .. '\n') end
+  spawned.on_exit(code)
+  pipes[2].reader(nil, stderr)
+  pipes[2].reader(nil, nil)
+  pipes[1].reader(nil, nil)
+  return emitted, terminal_opens
+end
+
+local auth_exit_events, auth_exit_fallbacks = run_cursor_exit(cursor_fixture_lines[6], '', 1)
+assert_equal(#auth_exit_events, 1, 'streamed Cursor auth failure emits one error')
+assert_equal(auth_exit_events[1].kind, 'error', 'streamed Cursor auth failure event kind')
+assert(auth_exit_events[1].payload.message:find('Authentication required', 1, true), 'streamed Cursor auth failure preserves provider error')
+assert(auth_exit_events[1].payload.message:find('cursor%-agent login'), 'streamed Cursor auth failure includes login remedy')
+assert_equal(auth_exit_fallbacks, 0, 'streamed Cursor auth failure does not open terminal fallback')
+
+local rate_limit_line = '{"type":"result","subtype":"error","is_error":true,"result":"Rate limit exceeded","request_id":"request-rate"}'
+local rate_exit_events, rate_exit_fallbacks = run_cursor_exit(rate_limit_line, '', 1)
+assert_equal(#rate_exit_events, 1, 'streamed Cursor rate-limit failure emits one error')
+assert_equal(rate_exit_events[1].payload.message, 'Rate limit exceeded', 'streamed Cursor rate-limit preserves provider error')
+assert_equal(rate_exit_fallbacks, 0, 'streamed Cursor rate-limit does not open terminal fallback')
+
+local process_exit_events, process_exit_fallbacks = run_cursor_exit(nil, 'Model is unavailable', 2)
+assert_equal(#process_exit_events, 1, 'ordinary Cursor nonzero exit emits one error')
+assert_equal(process_exit_events[1].payload.message, 'Model is unavailable', 'ordinary Cursor nonzero exit preserves stderr')
+assert_equal(process_exit_fallbacks, 0, 'ordinary Cursor nonzero exit does not open terminal fallback')
+
+local protocol_exit_events, protocol_exit_fallbacks = run_cursor_exit(nil, "error: unknown option '--stream-partial-output'", 2)
+assert_equal(#protocol_exit_events, 1, 'Cursor protocol incompatibility emits one error')
+assert(protocol_exit_events[1].payload.message:find("unknown option '--stream-partial-output'", 1, true), 'protocol incompatibility preserves stderr')
+assert_equal(protocol_exit_fallbacks, 1, 'Cursor protocol incompatibility opens terminal fallback')
+
+local spawn_fallbacks = 0
+local spawn_failure_uv = {
+  cwd = function() return '/workspace' end,
+  new_pipe = function()
+    return {
+      is_closing = function() return false end,
+      close = function() end,
+    }
+  end,
+  spawn = function() return nil, 'spawn failed' end,
+}
+local spawn_failure_events = {}
+local spawn_failure_adapter = CursorAdapter.new {
+  provider = providers.cursor,
+  uv = spawn_failure_uv,
+  command_runner = cursor_command_runner,
+  open_terminal = function() spawn_fallbacks = spawn_fallbacks + 1; return true end,
+}
+spawn_failure_adapter:prompt('spawn fixture', function(event) table.insert(spawn_failure_events, event) end)
+assert_equal(spawn_fallbacks, 1, 'Cursor spawn failure opens terminal fallback')
+assert_equal(spawn_failure_events[1].kind, 'error', 'Cursor spawn failure emits an error')
+assert(spawn_failure_events[1].payload.message:find('spawn failed', 1, true), 'Cursor spawn failure preserves the spawn error')
 
 assert_equal(config.set_active('cursor'), true, 'persisting a known active agent')
 assert_equal(config.active(), 'cursor', 'persisted active agent')
