@@ -187,15 +187,28 @@ assert(normalized_persisted_all_disabled.agents.pi.enabled == true, 'all-disable
 assert_equal(config.save(config_with_secrets), true, 'restoring sanitized harness configuration')
 
 local adapter_calls = {}
+local adapter_factories = { pi = 0, cursor = 0, codex = 0 }
+local adapter_behavior = {}
 local function fake_adapter(name)
   return {
     start = function()
       table.insert(adapter_calls, name .. ':start')
+      if adapter_behavior[name] and adapter_behavior[name].start then
+        return adapter_behavior[name].start()
+      end
       return true
     end,
-    stop = function() table.insert(adapter_calls, name .. ':stop') end,
+    stop = function()
+      table.insert(adapter_calls, name .. ':stop')
+      if adapter_behavior[name] and adapter_behavior[name].stop then
+        return adapter_behavior[name].stop()
+      end
+    end,
     prompt = function(_, text, callback)
       table.insert(adapter_calls, name .. ':prompt:' .. text)
+      if adapter_behavior[name] and adapter_behavior[name].prompt then
+        return adapter_behavior[name].prompt(text, callback)
+      end
       if callback then callback(name .. ':reply') end
     end,
     capabilities = function() return { provider = name, prompt = true } end,
@@ -205,7 +218,12 @@ end
 for _, name in ipairs { 'pi', 'cursor', 'codex' } do
   local provider_name = name
   package.preload['custom.agents.adapters.' .. provider_name] = function()
-    return { new = function() return fake_adapter(provider_name) end }
+    return {
+      new = function()
+        adapter_factories[provider_name] = adapter_factories[provider_name] + 1
+        return fake_adapter(provider_name)
+      end,
+    }
   end
 end
 
@@ -228,9 +246,13 @@ assert_equal(selected, false, 'manager rejects an unknown provider')
 assert(type(select_error) == 'string' and select_error:find('Unknown', 1, true), 'unknown provider selection reason')
 assert_equal(manager.current(), 'pi', 'unknown selection does not change the active agent')
 
+local initial_capabilities = manager.capabilities()
+assert_equal(initial_capabilities.provider, 'pi', 'capabilities load the active adapter')
+assert_equal(adapter_factories.pi, 1, 'capabilities cache the active adapter')
 local started, start_error = manager.start()
 assert_equal(started, true, 'manager starts the active adapter')
 assert_equal(start_error, nil, 'successful manager start reason')
+assert_equal(adapter_factories.pi, 1, 'start reuses the capabilities adapter')
 selected, select_error = manager.select 'cursor'
 assert_equal(selected, true, 'manager selects a known provider')
 assert_equal(select_error, nil, 'successful provider selection reason')
@@ -263,6 +285,63 @@ assert(type(start_error) == 'string' and start_error:find('codex', 1, true), 'un
 assert(start_error:find('install', 1, true), 'unavailable reason suggests installation')
 assert(start_error:find('login', 1, true), 'unavailable reason suggests authentication')
 assert_equal(notifications[1], start_error, 'unavailable provider notifies without throwing')
+
+assert_equal(manager.select('cursor'), true, 'manager selects Cursor while stopped')
+notifications = {}
+vim.notify = function(message) table.insert(notifications, message) end
+vim.fn.executable = function() return 0 end
+started, start_error = manager.start()
+vim.notify = original_notify
+vim.fn.executable = function(command)
+  if command == 'pi' or command == 'cursor-agent' or command == 'codex' then return 1 end
+  return 0
+end
+assert_equal(started, false, 'manager rejects unavailable Cursor')
+assert(start_error:find('cursor%-agent'), 'Cursor unavailable reason names registry executable')
+assert(start_error:find('cursor%-agent login'), 'Cursor unavailable reason includes login remedy')
+
+assert_equal(config.set_active('pi'), true, 'resetting active agent for failed start cleanup')
+package.loaded['custom.agents.manager'] = nil
+manager = require 'custom.agents.manager'
+adapter_behavior.pi = {
+  start = function() return false, 'partial start' end,
+}
+local calls_before_failed_start = #adapter_calls
+started, start_error = manager.start()
+adapter_behavior.pi = nil
+assert_equal(started, false, 'manager reports a partial start failure')
+assert_equal(start_error, 'partial start', 'manager preserves the start failure')
+assert_equal(adapter_calls[calls_before_failed_start + 1], 'pi:start', 'partial start is attempted')
+assert_equal(adapter_calls[calls_before_failed_start + 2], 'pi:stop', 'partial start is cleaned up')
+
+package.loaded['custom.agents.manager'] = nil
+manager = require 'custom.agents.manager'
+assert_equal(manager.start(), true, 'manager starts before failed switch stop')
+adapter_behavior.pi = { stop = function() error 'stop exploded' end }
+local calls_before_failed_switch = #adapter_calls
+selected, select_error = manager.select 'cursor'
+adapter_behavior.pi = nil
+assert_equal(selected, false, 'manager aborts selection when the old adapter cannot stop')
+assert(type(select_error) == 'string' and select_error:find('stop exploded', 1, true), 'failed stop selection reason')
+assert_equal(manager.current(), 'pi', 'failed old stop keeps the active provider')
+assert_equal(config.active(), 'pi', 'failed old stop does not persist the replacement')
+assert_equal(adapter_calls[calls_before_failed_switch + 1], 'pi:stop', 'switch attempts to stop old adapter')
+assert_equal(adapter_calls[calls_before_failed_switch + 2], nil, 'switch does not start replacement after failed stop')
+
+package.loaded['custom.agents.manager'] = nil
+manager = require 'custom.agents.manager'
+assert_equal(manager.start(), true, 'manager starts before prompt exception')
+notifications = {}
+local prompt_error
+adapter_behavior.pi = { prompt = function() error 'prompt exploded' end }
+vim.notify = function(message) table.insert(notifications, message) end
+local prompt_ok = pcall(manager.prompt, 'explode', function(_, err) prompt_error = err end)
+vim.notify = original_notify
+adapter_behavior.pi = nil
+vim.fn.executable = original_executable
+assert_equal(prompt_ok, true, 'prompt exceptions do not escape the manager')
+assert(type(prompt_error) == 'string' and prompt_error:find('prompt exploded', 1, true), 'prompt exception reaches callback')
+assert(type(notifications[1]) == 'string' and notifications[1]:find('prompt exploded', 1, true), 'prompt exception notifies')
 
 local config_file = assert(io.open(config_path, 'rb'))
 local saved_config = config_file:read '*a'

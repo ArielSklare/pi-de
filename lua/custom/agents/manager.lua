@@ -62,6 +62,36 @@ local function adapter_for(name)
   return create_adapter(name)
 end
 
+local function get_active_adapter()
+  local adapter, reason = adapter_for(active_name)
+  if adapter then active_adapter = adapter end
+  return adapter, reason
+end
+
+local function stop_adapter(adapter, name)
+  if not adapter or type(adapter.stop) ~= 'function' then return true, nil end
+
+  local called, stopped, stop_error = pcall(adapter.stop, adapter)
+  if not called then
+    return false, ("Agent provider '%s' failed to stop: %s"):format(name, stopped)
+  end
+  if stopped == false then
+    return false, stop_error or ("Agent provider '%s' failed to stop"):format(name)
+  end
+  return true, nil
+end
+
+local function cleanup_active()
+  local stopped, reason = stop_adapter(active_adapter, active_name)
+  if stopped then
+    state = 'stopped'
+    return true, nil
+  end
+
+  notify_error(reason)
+  return false, reason
+end
+
 function M.current()
   return active_name
 end
@@ -74,7 +104,7 @@ function M.start()
   if not available then return false, reason end
 
   local adapter
-  adapter, reason = adapter_for(active_name)
+  adapter, reason = get_active_adapter()
   if not adapter then
     notify_error(reason)
     return false, reason
@@ -93,9 +123,9 @@ function M.start()
     started, start_error = false, started
   end
   if not started then
-    state = 'stopped'
     reason = start_error or ("Agent provider '%s' failed to start"):format(active_name)
     notify_error(reason)
+    cleanup_active()
     return false, reason
   end
 
@@ -104,14 +134,8 @@ function M.start()
 end
 
 function M.stop()
-  if state == 'stopped' then return end
-
-  local adapter = active_adapter
-  state = 'stopped'
-  if adapter and type(adapter.stop) == 'function' then
-    local ok, err = pcall(adapter.stop, adapter)
-    if not ok then notify_error(("Agent provider '%s' failed to stop: %s"):format(active_name, err)) end
-  end
+  if state == 'stopped' then return true, nil end
+  return cleanup_active()
 end
 
 function M.select(name)
@@ -121,10 +145,10 @@ function M.select(name)
 
   if name == active_name then return config.set_active(name) end
 
-  local was_running = state == 'running'
+  local needs_stop = state ~= 'stopped'
   local next_adapter
   local reason
-  if was_running then
+  if needs_stop then
     local available
     available, reason = check_available(name)
     if not available then return false, reason end
@@ -133,17 +157,20 @@ function M.select(name)
       notify_error(reason)
       return false, reason
     end
+
+    local stopped
+    stopped, reason = cleanup_active()
+    if not stopped then return false, reason end
   end
 
   local persisted
   persisted, reason = config.set_active(name)
   if not persisted then return false, reason end
 
-  if was_running then M.stop() end
   active_name = name
   active_adapter = next_adapter
 
-  if was_running then return M.start() end
+  if needs_stop then return M.start() end
   return true, nil
 end
 
@@ -169,12 +196,26 @@ function M.prompt(text, callback)
     if callback then callback(nil, reason) end
     return
   end
-  active_adapter:prompt(text, callback)
+  local callback_called = false
+  local delegated_callback
+  if callback then
+    delegated_callback = function(...)
+      callback_called = true
+      return callback(...)
+    end
+  end
+
+  local ok, prompt_error = pcall(active_adapter.prompt, active_adapter, text, delegated_callback)
+  if not ok then
+    reason = ("Agent provider '%s' prompt failed: %s"):format(active_name, prompt_error)
+    notify_error(reason)
+    if callback and not callback_called then pcall(callback, nil, reason) end
+  end
 end
 
 function M.capabilities()
   local adapter = active_adapter
-  if not adapter then adapter = select(1, adapter_for(active_name)) end
+  if not adapter then adapter = select(1, get_active_adapter()) end
   if not adapter or type(adapter.capabilities) ~= 'function' then return {} end
 
   local ok, capabilities = pcall(adapter.capabilities, adapter)
