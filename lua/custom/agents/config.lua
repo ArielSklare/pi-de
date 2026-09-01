@@ -91,12 +91,17 @@ function M.active()
 end
 
 function M.set_active(name)
-  if not known_providers[name] then return false end
+  if not known_providers[name] then
+    return false, ("Unknown agent provider '%s'; choose pi, cursor, or codex"):format(tostring(name))
+  end
 
   local value = M.load()
-  if not value.agents[name].enabled then return false end
+  if not value.agents[name].enabled then
+    return false, ("Agent provider '%s' is disabled"):format(name)
+  end
   value.active_agent = name
-  return M.save(value)
+  if not M.save(value) then return false, 'Could not persist active agent selection' end
+  return true, nil
 end
 
 return M

@@ -47,6 +47,8 @@ else
       end,
     },
     json = { encode = json_encode, decode = json_decode },
+    log = { levels = { ERROR = 'ERROR', WARN = 'WARN' } },
+    notify = function() end,
     uv = {
       fs_open = fs_open,
       fs_fstat = function(file)
@@ -137,7 +139,9 @@ assert_equal(ok, false, 'unknown event kinds are rejected')
 
 assert_equal(config.set_active('cursor'), true, 'persisting a known active agent')
 assert_equal(config.active(), 'cursor', 'persisted active agent')
-assert_equal(config.set_active('missing'), false, 'rejecting an unknown active agent')
+local active_changed, active_error = config.set_active('missing')
+assert_equal(active_changed, false, 'rejecting an unknown active agent')
+assert(type(active_error) == 'string' and active_error:find('Unknown', 1, true), 'unknown active agent reason')
 local config_with_secrets = config.load()
 config_with_secrets.api_key = 'must-not-be-saved'
 config_with_secrets.agents.pi.token = 'must-not-be-saved'
@@ -181,6 +185,85 @@ assert_equal(normalized_persisted_all_disabled.active_agent, 'pi', 'all-disabled
 assert(normalized_persisted_all_disabled.agents.pi.enabled == true, 'all-disabled persisted config enables Pi fallback')
 
 assert_equal(config.save(config_with_secrets), true, 'restoring sanitized harness configuration')
+
+local adapter_calls = {}
+local function fake_adapter(name)
+  return {
+    start = function()
+      table.insert(adapter_calls, name .. ':start')
+      return true
+    end,
+    stop = function() table.insert(adapter_calls, name .. ':stop') end,
+    prompt = function(_, text, callback)
+      table.insert(adapter_calls, name .. ':prompt:' .. text)
+      if callback then callback(name .. ':reply') end
+    end,
+    capabilities = function() return { provider = name, prompt = true } end,
+  }
+end
+
+for _, name in ipairs { 'pi', 'cursor', 'codex' } do
+  local provider_name = name
+  package.preload['custom.agents.adapters.' .. provider_name] = function()
+    return { new = function() return fake_adapter(provider_name) end }
+  end
+end
+
+local terminal_toggles = {}
+package.preload['custom.agents.terminal'] = function()
+  return {
+    toggle_active = function() table.insert(terminal_toggles, config.active()) end,
+  }
+end
+
+assert_equal(config.set_active('pi'), true, 'resetting active agent for manager tests')
+vim.fn.executable = function(command)
+  if command == 'pi' or command == 'cursor-agent' or command == 'codex' then return 1 end
+  return 0
+end
+local manager = require 'custom.agents.manager'
+assert_equal(manager.current(), 'pi', 'manager reads the persisted active agent')
+local selected, select_error = manager.select 'missing'
+assert_equal(selected, false, 'manager rejects an unknown provider')
+assert(type(select_error) == 'string' and select_error:find('Unknown', 1, true), 'unknown provider selection reason')
+assert_equal(manager.current(), 'pi', 'unknown selection does not change the active agent')
+
+local started, start_error = manager.start()
+assert_equal(started, true, 'manager starts the active adapter')
+assert_equal(start_error, nil, 'successful manager start reason')
+selected, select_error = manager.select 'cursor'
+assert_equal(selected, true, 'manager selects a known provider')
+assert_equal(select_error, nil, 'successful provider selection reason')
+assert_equal(config.active(), 'cursor', 'manager selection persists through config')
+assert_equal(adapter_calls[1], 'pi:start', 'initial adapter start')
+assert_equal(adapter_calls[2], 'pi:stop', 'switch stops the old adapter first')
+assert_equal(adapter_calls[3], 'cursor:start', 'switch starts the new adapter second')
+
+local capabilities = manager.capabilities()
+assert_equal(capabilities.provider, 'cursor', 'capabilities delegate to the active adapter')
+local prompt_reply
+manager.prompt('hello', function(reply) prompt_reply = reply end)
+assert_equal(adapter_calls[4], 'cursor:prompt:hello', 'prompt delegates to the active adapter')
+assert_equal(prompt_reply, 'cursor:reply', 'prompt callback is preserved')
+manager.toggle_terminal()
+assert_equal(terminal_toggles[1], 'cursor', 'terminal toggle uses the active provider')
+manager.stop()
+assert_equal(adapter_calls[5], 'cursor:stop', 'stop delegates to the active adapter')
+
+assert_equal(manager.select('codex'), true, 'manager persists another known provider while stopped')
+local notifications = {}
+local original_notify = vim.notify
+vim.notify = function(message) table.insert(notifications, message) end
+vim.fn.executable = function() return 0 end
+started, start_error = manager.start()
+vim.notify = original_notify
+vim.fn.executable = original_executable
+assert_equal(started, false, 'manager rejects an unavailable provider')
+assert(type(start_error) == 'string' and start_error:find('codex', 1, true), 'unavailable reason names executable')
+assert(start_error:find('install', 1, true), 'unavailable reason suggests installation')
+assert(start_error:find('login', 1, true), 'unavailable reason suggests authentication')
+assert_equal(notifications[1], start_error, 'unavailable provider notifies without throwing')
+
 local config_file = assert(io.open(config_path, 'rb'))
 local saved_config = config_file:read '*a'
 config_file:close()
