@@ -8,6 +8,8 @@ local active_adapter
 local adapters = {}
 local state = 'stopped'
 local stop_waiters = {}
+local pending_transition
+local transition_waiting = false
 local handle_adapter_exit
 
 local auth_remedies = {
@@ -202,6 +204,37 @@ function M.stop(callback)
   return cleanup_active(callback)
 end
 
+local function complete_pending_transition(stopped, stop_reason)
+  local transition = pending_transition
+  pending_transition = nil
+  transition_waiting = false
+  if not transition then return end
+
+  if not stopped then
+    transition.completed = true
+    transition.success = false
+    transition.reason = stop_reason
+    if transition.callback then transition.callback(false, stop_reason) end
+    return
+  end
+
+  local persisted, reason = config.set_active(transition.name)
+  if not persisted then
+    transition.completed = true
+    transition.success = false
+    transition.reason = reason
+    notify_error(reason)
+    if transition.callback then transition.callback(false, reason) end
+    return
+  end
+
+  active_name = transition.name
+  active_adapter = transition.adapter
+  transition.success, transition.reason = M.start()
+  transition.completed = true
+  if transition.callback then transition.callback(transition.success, transition.reason) end
+end
+
 function M.select(name, callback)
   if not registry.get(name) then
     local reason = ("Unknown agent provider '%s'; choose pi, cursor, or codex"):format(tostring(name))
@@ -210,68 +243,58 @@ function M.select(name, callback)
     return false, reason
   end
 
-  if name == active_name then
+  if name == active_name and state ~= 'stopping' then
     local persisted, reason = config.set_active(name)
     if not persisted then notify_error(reason) end
     if callback then callback(persisted, reason) end
     return persisted, reason
   end
 
-  local needs_stop = state ~= 'stopped'
-  local next_adapter
-  local reason
-  if needs_stop then
-    local available
-    available, reason = check_available(name)
-    if not available then
-      if callback then callback(false, reason) end
-      return false, reason
-    end
-    next_adapter, reason = adapter_for(name)
-    if not next_adapter then
-      notify_error(reason)
-      if callback then callback(false, reason) end
-      return false, reason
-    end
-  end
-
-  local completed = false
-  local final_success, final_reason
-  local function complete(stopped, stop_reason)
-    if not stopped then
-      completed, final_success, final_reason = true, false, stop_reason
-      if callback then callback(false, stop_reason) end
-      return
-    end
-
-    local persisted
-    persisted, final_reason = config.set_active(name)
-    if not persisted then
-      completed, final_success = true, false
-      notify_error(final_reason)
-      if callback then callback(false, final_reason) end
-      return
-    end
-
-    active_name = name
-    active_adapter = next_adapter or adapters[name]
-    if needs_stop then
-      final_success, final_reason = M.start()
+  if state == 'stopped' then
+    local persisted, reason = config.set_active(name)
+    if persisted then
+      active_name = name
+      active_adapter = adapters[name]
     else
-      final_success, final_reason = true, nil
+      notify_error(reason)
     end
-    completed = true
-    if callback then callback(final_success, final_reason) end
+    if callback then callback(persisted, reason) end
+    return persisted, reason
   end
 
-  if needs_stop then
-    local accepted, stop_reason = cleanup_active(complete)
-    if not accepted and not completed then return false, stop_reason end
-  else
-    complete(true, nil)
+  local available, reason = check_available(name)
+  if not available then
+    if callback then callback(false, reason) end
+    return false, reason
   end
 
-  if completed then return final_success, final_reason end
+  local next_adapter
+  next_adapter, reason = adapter_for(name)
+  if not next_adapter then
+    notify_error(reason)
+    if callback then callback(false, reason) end
+    return false, reason
+  end
+
+  local superseded = pending_transition
+  local transition = {
+    name = name,
+    adapter = next_adapter,
+    callback = callback,
+    completed = false,
+  }
+  pending_transition = transition
+  if superseded and superseded.callback then
+    superseded.callback(false, 'Agent selection was superseded by a newer request')
+  end
+
+  if not transition_waiting then
+    transition_waiting = true
+    local accepted, stop_reason = cleanup_active(complete_pending_transition)
+    if not accepted and not transition.completed then return false, stop_reason end
+  end
+
+  if transition.completed then return transition.success, transition.reason end
   return true, nil
 end
 

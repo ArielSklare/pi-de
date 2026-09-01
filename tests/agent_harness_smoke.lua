@@ -1480,22 +1480,26 @@ local calls_before_delayed_switch = #adapter_calls
 selected, select_error = manager.select 'cursor'
 assert_equal(selected, true, 'manager accepts a switch while shutdown is pending')
 assert_equal(select_error, nil, 'pending switch has no immediate error')
+selected, select_error = manager.select 'codex'
+assert_equal(selected, true, 'manager accepts a newer switch while shutdown is pending')
+assert_equal(select_error, nil, 'coalesced pending switch has no immediate error')
 assert_equal(manager.current(), 'pi', 'manager retains old provider until shutdown completes')
-assert_equal(adapter_calls[calls_before_delayed_switch + 1], 'pi:stop', 'delayed switch signals old provider')
-assert_equal(adapter_calls[calls_before_delayed_switch + 2], nil, 'replacement does not start before old process exits')
+assert_equal(adapter_calls[calls_before_delayed_switch + 1], 'pi:stop', 'delayed switch signals old provider once')
+assert_equal(adapter_calls[calls_before_delayed_switch + 2], nil, 'no replacement starts before old process exits')
 delayed_stop_completion(true)
 adapter_behavior.pi = nil
-assert_equal(manager.current(), 'cursor', 'manager changes provider after shutdown completion')
-assert_equal(adapter_calls[calls_before_delayed_switch + 2], 'cursor:start', 'replacement starts after old cleanup completes')
+assert_equal(manager.current(), 'codex', 'manager coalesces pending switches to the latest provider')
+assert_equal(adapter_calls[calls_before_delayed_switch + 2], 'codex:start', 'only the latest replacement starts after cleanup')
+assert_equal(adapter_calls[calls_before_delayed_switch + 3], nil, 'coalesced switch starts exactly one replacement')
 
-local cursor_starts_before_crash = 0
-for _, call in ipairs(adapter_calls) do if call == 'cursor:start' then cursor_starts_before_crash = cursor_starts_before_crash + 1 end end
-adapter_instances.cursor.live = false
-adapter_instances.cursor.on_exit(17, false)
+local codex_starts_before_crash = 0
+for _, call in ipairs(adapter_calls) do if call == 'codex:start' then codex_starts_before_crash = codex_starts_before_crash + 1 end end
+adapter_instances.codex.live = false
+adapter_instances.codex.on_exit(17, false)
 assert_equal(manager.start(), true, 'AgentStart recovers after an unexpected adapter exit')
-local cursor_starts_after_crash = 0
-for _, call in ipairs(adapter_calls) do if call == 'cursor:start' then cursor_starts_after_crash = cursor_starts_after_crash + 1 end end
-assert_equal(cursor_starts_after_crash, cursor_starts_before_crash + 1, 'unexpected exit delegates a fresh adapter start')
+local codex_starts_after_crash = 0
+for _, call in ipairs(adapter_calls) do if call == 'codex:start' then codex_starts_after_crash = codex_starts_after_crash + 1 end end
+assert_equal(codex_starts_after_crash, codex_starts_before_crash + 1, 'unexpected exit delegates a fresh adapter start')
 manager.stop()
 assert_equal(config.set_active('pi'), true, 'resetting active provider after delayed lifecycle tests')
 
