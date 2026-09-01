@@ -46,13 +46,13 @@ Start Neovim and allow the configuration to install its plugins. Pi's first-run 
 
 ## Current provider capabilities
 
-Phase A provides a common lifecycle and terminal surface, but the provider protocols are not yet feature-equivalent.
+Phase A provides a common manager and terminal surface, but the provider protocols are not yet feature-equivalent. Pi retains its compatibility JSONL RPC path with correlated raw response and `agent_settled` callbacks; Cursor Agent and Codex emit common normalized lifecycle events where their current adapters implement them.
 
 | Capability | Pi | Cursor Agent | Codex |
 |---|---|---|---|
 | Interactive terminal | Yes | Yes | Yes |
 | Structured prompt/stream | Pi JSONL RPC | `stream-json`; terminal fallback when the installed CLI lacks compatible stream support | `exec --json` |
-| Text/tool lifecycle normalization | Pi responses | Text and tool progress | Text, tool, approval, and completion events |
+| Text/tool lifecycle normalization | No; compatibility/raw RPC callbacks only | Normalized text and tool-progress events | Normalized text, tool, approval, and completion events |
 | Harness approval UI/forwarding | No | No | No; approval events can be normalized, but the app-server approval flow is not implemented |
 | Harness structured edits | Pi-only compatibility workflow | No | No |
 | Resume/session UI | No | No | No |
