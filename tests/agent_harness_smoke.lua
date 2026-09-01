@@ -217,7 +217,7 @@ vim.fn.expand = original_expand
 
 local created_terminals = {}
 package.preload['custom.plugins.setup'] = function()
-  return { get_pi_command = function() return { 'pi', '--model', 'model with space' } end }
+  return { get_pi_command = function() return { 'pi', '--model', "model with space and 'quote'", '$(not-shell-code)' } end }
 end
 package.preload['toggleterm.terminal'] = function()
   local Terminal = {}
@@ -230,18 +230,31 @@ package.preload['toggleterm.terminal'] = function()
   return { Terminal = Terminal }
 end
 local original_shellescape = vim.fn.shellescape
-vim.fn.shellescape = function(value) return "'" .. value .. "'" end
+local shellescaped_values = {}
+vim.fn.shellescape = function(value)
+  table.insert(shellescaped_values, value)
+  return '<' .. value .. '>'
+end
 package.loaded['custom.agents.terminal'] = nil
 local terminal = require 'custom.agents.terminal'
 local terminal_opened, terminal_error = terminal.open 'pi'
 assert_equal(terminal_opened, true, 'opening the Pi terminal: ' .. tostring(terminal_error))
-assert_equal(created_terminals[1].options.cmd, "'pi' '--model' 'model with space'", 'Pi terminal command construction')
+assert_equal(
+  created_terminals[1].options.cmd,
+  "<pi> <--model> <model with space and 'quote'> <$(not-shell-code)>",
+  'Pi terminal command construction'
+)
+assert_equal(
+  table.concat(shellescaped_values, '|'),
+  "pi|--model|model with space and 'quote'|$(not-shell-code)",
+  'every terminal argument is escaped independently'
+)
 assert_equal(created_terminals[1].options.display_name, 'Pi', 'Pi terminal display name')
 assert_equal(terminal.open('cursor'), true, 'opening the Cursor terminal')
-assert_equal(created_terminals[2].options.cmd, "'cursor-agent'", 'Cursor terminal command construction')
+assert_equal(created_terminals[2].options.cmd, '<cursor-agent>', 'Cursor terminal command construction')
 assert_equal(created_terminals[2].options.display_name, 'Cursor Agent', 'Cursor terminal display name')
 assert_equal(terminal.open('codex'), true, 'opening the Codex terminal')
-assert_equal(created_terminals[3].options.cmd, "'codex'", 'Codex terminal command construction')
+assert_equal(created_terminals[3].options.cmd, '<codex>', 'Codex terminal command construction')
 assert_equal(created_terminals[3].options.display_name, 'Codex', 'Codex terminal display name')
 assert_equal(terminal.open('pi'), true, 'reopening the Pi terminal')
 assert_equal(#created_terminals, 3, 'one ToggleTerm instance per provider')
@@ -254,6 +267,7 @@ assert_equal(created_terminals[2].toggles, 2, 'active terminal routes to Cursor'
 assert_equal(config.set_active('pi'), true, 'restoring Pi after terminal routing')
 vim.fn.shellescape = original_shellescape
 package.loaded['custom.agents.terminal'] = nil
+package.loaded['custom.agents.manager'] = nil
 package.loaded['custom.plugins.setup'] = nil
 package.loaded['toggleterm.terminal'] = nil
 package.preload['custom.plugins.setup'] = nil
@@ -306,7 +320,11 @@ local plugin_terminal_calls = {}
 package.preload['custom.agents.terminal'] = function()
   return {
     open = function(name) table.insert(plugin_terminal_calls, 'open:' .. name); return true end,
-    toggle_active = function() table.insert(plugin_terminal_calls, 'toggle') end,
+  }
+end
+package.preload['custom.agents.manager'] = function()
+  return {
+    toggle_terminal = function() table.insert(plugin_terminal_calls, 'toggle') end,
   }
 end
 local original_pack = vim.pack
@@ -330,8 +348,10 @@ terminal_keymaps['<leader>ta']()
 assert_equal(table.concat(plugin_terminal_calls, ','), 'open:pi,toggle', 'agent terminal keymap routing')
 package.loaded['custom.plugins.toggleterm'] = nil
 package.loaded['custom.agents.terminal'] = nil
+package.loaded['custom.agents.manager'] = nil
 package.loaded.toggleterm = nil
 package.preload['custom.agents.terminal'] = nil
+package.preload['custom.agents.manager'] = nil
 package.preload.toggleterm = nil
 vim.pack = original_pack
 vim.version = original_version
@@ -617,9 +637,14 @@ for _, name in ipairs { 'pi', 'cursor', 'codex' } do
 end
 
 local terminal_toggles = {}
+local terminal_behavior = {}
 package.preload['custom.agents.terminal'] = function()
   return {
-    toggle_active = function() table.insert(terminal_toggles, config.active()) end,
+    open = function(name)
+      table.insert(terminal_toggles, name)
+      if terminal_behavior.open then return terminal_behavior.open(name) end
+      return true
+    end,
   }
 end
 
@@ -658,12 +683,34 @@ assert_equal(adapter_calls[4], 'cursor:prompt:hello', 'prompt delegates to the a
 assert_equal(prompt_reply, 'cursor:reply', 'prompt callback is preserved')
 manager.toggle_terminal()
 assert_equal(terminal_toggles[1], 'cursor', 'terminal toggle uses the active provider')
+assert_equal(config.set_active('pi'), true, 'forcing persisted/runtime active-agent divergence')
+assert_equal(manager.current(), 'cursor', 'persisted config cannot replace manager runtime authority')
+manager.toggle_terminal()
+assert_equal(terminal_toggles[2], 'cursor', 'terminal toggle uses manager.current during config divergence')
+assert_equal(config.set_active('cursor'), true, 'restoring persisted active agent after divergence test')
+
+local original_notify = vim.notify
+local notifications = {}
+vim.notify = function(message) table.insert(notifications, message) end
+terminal_behavior.open = function() return false, 'terminal toggle failed' end
+local toggled, toggle_reason = manager.toggle_terminal()
+assert_equal(toggled, false, 'terminal failure propagates through manager')
+assert_equal(toggle_reason, 'terminal toggle failed', 'terminal failure reason propagates through manager')
+assert_equal(notifications[1], 'terminal toggle failed', 'terminal failure notifies through manager')
+
+terminal_behavior.open = function() error 'terminal exploded' end
+local toggle_ok
+toggle_ok, toggled, toggle_reason = pcall(manager.toggle_terminal)
+vim.notify = original_notify
+terminal_behavior.open = nil
+assert_equal(toggle_ok, true, 'terminal exceptions do not escape manager')
+assert_equal(toggled, false, 'terminal exception is reported as failure')
+assert(type(toggle_reason) == 'string' and toggle_reason:find('terminal exploded', 1, true), 'terminal exception reason propagates')
 manager.stop()
 assert_equal(adapter_calls[5], 'cursor:stop', 'stop delegates to the active adapter')
 
 assert_equal(manager.select('codex'), true, 'manager persists another known provider while stopped')
-local notifications = {}
-local original_notify = vim.notify
+notifications = {}
 vim.notify = function(message) table.insert(notifications, message) end
 vim.fn.executable = function() return 0 end
 started, start_error = manager.start()

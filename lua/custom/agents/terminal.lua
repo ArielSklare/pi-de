@@ -1,4 +1,3 @@
-local config = require 'custom.agents.config'
 local registry = require 'custom.agents.registry'
 
 local M = {}
@@ -66,7 +65,8 @@ function M.open(name)
 end
 
 function M.toggle_active()
-  return M.open(config.active())
+  local manager = require 'custom.agents.manager'
+  return M.open(manager.current())
 end
 
 return M

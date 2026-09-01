@@ -186,12 +186,30 @@ function M.select(name)
 end
 
 function M.toggle_terminal()
-  local ok, terminal = pcall(require, 'custom.agents.terminal')
-  if not ok or type(terminal.toggle_active) ~= 'function' then
-    notify_error('Agent terminal is unavailable')
-    return
+  local loaded, terminal = pcall(require, 'custom.agents.terminal')
+  if not loaded then
+    local reason = 'Agent terminal is unavailable: ' .. tostring(terminal)
+    notify_error(reason)
+    return false, reason
   end
-  terminal.toggle_active()
+  if type(terminal.open) ~= 'function' then
+    local reason = 'Agent terminal is unavailable: open() is not supported'
+    notify_error(reason)
+    return false, reason
+  end
+
+  local called, toggled, reason = pcall(terminal.open, active_name)
+  if not called then
+    reason = ('Could not toggle %s terminal: %s'):format(active_name, toggled)
+    notify_error(reason)
+    return false, reason
+  end
+  if toggled == false then
+    reason = reason or ('Could not toggle %s terminal'):format(active_name)
+    notify_error(reason)
+    return false, reason
+  end
+  return true, nil
 end
 
 function M.prompt(text, callback)

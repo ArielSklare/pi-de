@@ -30,11 +30,14 @@ toggleterm.setup{
 }
 
 local agent_terminal = require 'custom.agents.terminal'
+local agent_manager = require 'custom.agents.manager'
 
 -- Keep the original Pi entry point as a compatibility alias.
 function _G.pi_open_term()
-  return agent_terminal.open 'pi'
+  local opened, reason = agent_terminal.open 'pi'
+  if not opened then vim.notify(reason, vim.log.levels.ERROR) end
+  return opened, reason
 end
 
 vim.keymap.set('n', '<leader>tp', _G.pi_open_term, { desc = 'Open Pi terminal' })
-vim.keymap.set('n', '<leader>ta', agent_terminal.toggle_active, { desc = 'Toggle active agent terminal' })
+vim.keymap.set('n', '<leader>ta', agent_manager.toggle_terminal, { desc = 'Toggle active agent terminal' })
