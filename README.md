@@ -31,16 +31,16 @@ Clone this repository to `~/.config/nvim` (or clone elsewhere and set `$MYVIMRC`
 git clone https://github.com/yourusername/nvim-pi-ide.git ~/.config/nvim
 ```
 
-Start Neovim and allow the configuration to install its plugins. Pi's first-run setup can reuse the existing login from `~/.pi/agent/auth.json` (recommended) or configure a separate provider override.
+Start Neovim and allow the configuration to install its plugins. Pi's first-run setup reuses the existing login from `~/.pi/agent/auth.json` (recommended). `:PiSetup` may store non-secret provider/model flags, but authentication must be configured through Pi itself.
 
 ## Generic agent commands
 
 | Command | Behavior |
 |---|---|
-| `:AgentSelect` | Choose Pi, Cursor Agent, or Codex. If an agent is running, the manager stops it before starting the selected provider; otherwise it only persists the selection. |
+| `:AgentSelect` | Choose Pi, Cursor Agent, or Codex. If an agent is running, the manager waits for its process exit and pipe cleanup before persisting and starting the replacement; otherwise it only persists the selection. |
 | `:AgentToggle` | Open or hide the active provider's interactive side terminal. |
-| `:AgentStart` | Check the active executable and start its structured adapter. Authentication or compatibility failures are shown without retry loops. |
-| `:AgentStop` | Stop the active structured provider process. The provider terminal is managed separately by ToggleTerm. |
+| `:AgentStart` | Check the active executable and start its structured adapter. Authentication or compatibility failures are shown without retry loops. A provider that exited unexpectedly can be started again. |
+| `:AgentStop` | Signal the active structured provider and complete only after process exit and pipe cleanup. The provider terminal is managed separately by ToggleTerm. |
 
 `<leader>ta` toggles the active provider terminal. `<leader>tp` remains a Pi-terminal compatibility mapping. The active provider is stored in `~/.local/share/nvim/agent_harness.json` (or `$XDG_DATA_HOME/nvim/agent_harness.json`); this mode-0600 file contains selection and enablement only, never credentials.
 
@@ -71,7 +71,7 @@ These commands are intentionally Pi-only and select Pi when necessary:
 
 There are no generic `:AgentSuggest`, `:AgentAccept`, or `:AgentDiscard` commands in Phase A.
 
-When **Use existing Pi login** is selected, credentials and the default model remain managed by Pi in `~/.pi/agent/auth.json` and `~/.pi/agent/settings.json`; the Neovim profile does not copy them. Use `/login` and `/model` inside Pi to change that base configuration. A Pi override profile is stored in `~/.local/share/nvim/pi_config.json` (or `$XDG_DATA_HOME/nvim/pi_config.json`) with user-only permissions.
+When **Use existing Pi login** is selected, credentials and the default model remain managed by Pi in `~/.pi/agent/auth.json` and `~/.pi/agent/settings.json`; the Neovim profile does not copy them. Use `/login` and `/model` inside Pi to change that base configuration. A Pi override profile may store only non-secret provider/model selection in `~/.local/share/nvim/pi_config.json` (or `$XDG_DATA_HOME/nvim/pi_config.json`) with user-only permissions. Legacy `api_key` fields are removed automatically. The harness never exports Pi override credentials into Neovim's global environment, so Cursor and Codex child processes receive no Pi-specific credential injection.
 
 ## Validation
 

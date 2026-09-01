@@ -104,6 +104,7 @@ function CursorAdapter.new(options)
     exit_code = nil,
     error_emitted = false,
     structured_error = nil,
+    stop_callbacks = {},
   }, CursorAdapter)
 end
 
@@ -123,6 +124,10 @@ function CursorAdapter:_open_fallback()
   self.fallback_opened = true
   self.protocol = self.fallback_protocol
   return true, nil
+end
+
+function CursorAdapter:is_running()
+  return self.started
 end
 
 function CursorAdapter:start()
@@ -249,6 +254,13 @@ function CursorAdapter:_maybe_finalize()
   self.process, self.stdout, self.stderr = nil, nil, nil
   self.callback = nil
   self.stopping = false
+  local stop_callbacks = self.stop_callbacks
+  self.stop_callbacks = {}
+  if #stop_callbacks > 0 then
+    self.schedule(function()
+      for _, callback in ipairs(stop_callbacks) do callback(true) end
+    end)
+  end
 end
 
 function CursorAdapter:_consume_stdout(err, data)
@@ -337,12 +349,27 @@ function CursorAdapter:prompt(text, callback)
   self.uv.read_start(self.stderr, function(err, data) self:_consume_stderr(err, data) end)
 end
 
-function CursorAdapter:stop()
+function CursorAdapter:stop(callback)
   self.started = false
-  if self.process and not self.process:is_closing() then
-    self.stopping = true
-    self.process:kill 'sigterm'
+  if callback then table.insert(self.stop_callbacks, callback) end
+  if not self.process then
+    local callbacks = self.stop_callbacks
+    self.stop_callbacks = {}
+    for _, completed in ipairs(callbacks) do completed(true) end
+    return true
   end
+  if not self.stopping and not self.process:is_closing() then
+    self.stopping = true
+    local ok, reason = pcall(self.process.kill, self.process, 'sigterm')
+    if not ok then
+      self.stopping = false
+      local callbacks = self.stop_callbacks
+      self.stop_callbacks = {}
+      for _, completed in ipairs(callbacks) do completed(false, tostring(reason)) end
+      return false, tostring(reason)
+    end
+  end
+  return true
 end
 
 function CursorAdapter:capabilities()

@@ -7,6 +7,8 @@ local active_name = config.active()
 local active_adapter
 local adapters = {}
 local state = 'stopped'
+local stop_waiters = {}
+local handle_adapter_exit
 
 local auth_remedies = {
   pi = "configure authentication with the 'pi' CLI",
@@ -56,6 +58,7 @@ local function create_adapter(name)
       if not loaded then return false, 'Agent terminal is unavailable: ' .. tostring(terminal) end
       return terminal.open(provider_name)
     end,
+    on_exit = function(code, expected) handle_adapter_exit(name, code, expected) end,
   })
   if not created then
     return nil, ("Agent provider '%s' adapter could not be created: %s"):format(name, adapter)
@@ -77,28 +80,64 @@ local function get_active_adapter()
   return adapter, reason
 end
 
-local function stop_adapter(adapter, name)
-  if not adapter or type(adapter.stop) ~= 'function' then return true, nil end
+handle_adapter_exit = function(name, _, expected)
+  if expected or name ~= active_name or adapters[name] ~= active_adapter then return end
+  if state == 'running' or state == 'starting' then state = 'stopped' end
+end
 
-  local called, stopped, stop_error = pcall(adapter.stop, adapter)
+local function finish_stop(stopped, reason)
+  state = stopped and 'stopped' or 'running'
+  local waiters = stop_waiters
+  stop_waiters = {}
+  if not stopped and reason then notify_error(reason) end
+  for _, waiter in ipairs(waiters) do waiter(stopped, reason) end
+end
+
+local function stop_adapter(adapter, name, callback)
+  if not adapter or type(adapter.stop) ~= 'function' then
+    callback(true, nil)
+    return true, nil
+  end
+
+  local completed = false
+  local function complete(stopped, stop_error)
+    if completed then return end
+    completed = true
+    if stopped == false then
+      callback(false, stop_error or ("Agent provider '%s' failed to stop"):format(name))
+    else
+      callback(true, nil)
+    end
+  end
+
+  local called, stopped, stop_error = pcall(adapter.stop, adapter, complete)
   if not called then
-    return false, ("Agent provider '%s' failed to stop: %s"):format(name, stopped)
+    local reason = ("Agent provider '%s' failed to stop: %s"):format(name, stopped)
+    complete(false, reason)
+    return false, reason
   end
   if stopped == false then
-    return false, stop_error or ("Agent provider '%s' failed to stop"):format(name)
+    local reason = stop_error or ("Agent provider '%s' failed to stop"):format(name)
+    complete(false, reason)
+    return false, reason
   end
   return true, nil
 end
 
-local function cleanup_active()
-  local stopped, reason = stop_adapter(active_adapter, active_name)
-  if stopped then
-    state = 'stopped'
+local function cleanup_active(callback)
+  callback = callback or function() end
+  if state == 'stopped' then
+    callback(true, nil)
     return true, nil
   end
 
-  notify_error(reason)
-  return false, reason
+  table.insert(stop_waiters, callback)
+  if state == 'stopping' then return true, nil end
+
+  state = 'stopping'
+  local accepted, reason = stop_adapter(active_adapter, active_name, finish_stop)
+  if not accepted and state == 'stopping' then finish_stop(false, reason) end
+  return accepted, reason
 end
 
 function M.current()
@@ -113,8 +152,14 @@ function M.adapter(expected_name)
 end
 
 function M.start()
-  if state == 'running' then return true, nil end
+  if state == 'running' then
+    if not active_adapter or type(active_adapter.is_running) ~= 'function' or active_adapter:is_running() then
+      return true, nil
+    end
+    state = 'stopped'
+  end
   if state == 'starting' then return false, 'Active agent is already starting' end
+  if state == 'stopping' then return false, 'Active agent is still stopping' end
 
   local available, reason = check_available(active_name)
   if not available then return false, reason end
@@ -149,17 +194,28 @@ function M.start()
   return true, nil
 end
 
-function M.stop()
-  if state == 'stopped' then return true, nil end
-  return cleanup_active()
+function M.stop(callback)
+  if state == 'stopped' then
+    if callback then callback(true, nil) end
+    return true, nil
+  end
+  return cleanup_active(callback)
 end
 
-function M.select(name)
+function M.select(name, callback)
   if not registry.get(name) then
-    return false, ("Unknown agent provider '%s'; choose pi, cursor, or codex"):format(tostring(name))
+    local reason = ("Unknown agent provider '%s'; choose pi, cursor, or codex"):format(tostring(name))
+    notify_error(reason)
+    if callback then callback(false, reason) end
+    return false, reason
   end
 
-  if name == active_name then return config.set_active(name) end
+  if name == active_name then
+    local persisted, reason = config.set_active(name)
+    if not persisted then notify_error(reason) end
+    if callback then callback(persisted, reason) end
+    return persisted, reason
+  end
 
   local needs_stop = state ~= 'stopped'
   local next_adapter
@@ -167,26 +223,55 @@ function M.select(name)
   if needs_stop then
     local available
     available, reason = check_available(name)
-    if not available then return false, reason end
+    if not available then
+      if callback then callback(false, reason) end
+      return false, reason
+    end
     next_adapter, reason = adapter_for(name)
     if not next_adapter then
       notify_error(reason)
+      if callback then callback(false, reason) end
       return false, reason
     end
-
-    local stopped
-    stopped, reason = cleanup_active()
-    if not stopped then return false, reason end
   end
 
-  local persisted
-  persisted, reason = config.set_active(name)
-  if not persisted then return false, reason end
+  local completed = false
+  local final_success, final_reason
+  local function complete(stopped, stop_reason)
+    if not stopped then
+      completed, final_success, final_reason = true, false, stop_reason
+      if callback then callback(false, stop_reason) end
+      return
+    end
 
-  active_name = name
-  active_adapter = next_adapter or adapters[name]
+    local persisted
+    persisted, final_reason = config.set_active(name)
+    if not persisted then
+      completed, final_success = true, false
+      notify_error(final_reason)
+      if callback then callback(false, final_reason) end
+      return
+    end
 
-  if needs_stop then return M.start() end
+    active_name = name
+    active_adapter = next_adapter or adapters[name]
+    if needs_stop then
+      final_success, final_reason = M.start()
+    else
+      final_success, final_reason = true, nil
+    end
+    completed = true
+    if callback then callback(final_success, final_reason) end
+  end
+
+  if needs_stop then
+    local accepted, stop_reason = cleanup_active(complete)
+    if not accepted and not completed then return false, stop_reason end
+  else
+    complete(true, nil)
+  end
+
+  if completed then return final_success, final_reason end
   return true, nil
 end
 

@@ -245,6 +245,7 @@ assert_equal(codex_capabilities.approval_policy, 'on-request', 'Codex capability
 
 codex_adapter:prompt('hello Codex', function(event) table.insert(codex_events, event) end)
 assert_equal(codex_spawn.executable, 'codex', 'Codex exec executable')
+assert_equal(codex_spawn.options.env, nil, 'Codex child receives no Pi-specific environment override')
 assert_equal(
   table.concat(codex_spawn.options.args, ' '),
   'exec --json --sandbox read-only -c approval_policy="on-request" -',
@@ -342,6 +343,55 @@ assert_equal(auth_started, false, 'unauthenticated Codex fails startup')
 assert(auth_error:find('codex login', 1, true), 'unauthenticated Codex gives login remedy')
 assert_equal(auth_checks, 1, 'unauthenticated Codex does not retry')
 assert_equal(#auth_notifications, 0, 'authentication failure notification is manager-owned')
+
+;(function()
+local codex_status_failure = CodexAdapter.new {
+  provider = providers.codex,
+  command_runner = function() return { code = 1, stderr = 'status command timed out' } end,
+}
+local codex_status_started, codex_status_error = codex_status_failure:start()
+assert_equal(codex_status_started, false, 'failed Codex status command fails startup')
+assert(codex_status_error:find('status command timed out', 1, true), 'failed Codex status preserves its actual error')
+assert(not codex_status_error:find('not authenticated', 1, true), 'failed Codex status is not mislabeled unauthenticated')
+
+local delayed_codex_pipes = {}
+local delayed_codex_exit
+local delayed_codex_uv = {
+  cwd = function() return '/workspace' end,
+  read_start = function(pipe, callback) pipe.reader = callback end,
+  new_pipe = function()
+    local pipe = { closing = false }
+    function pipe:is_closing() return self.closing end
+    function pipe:close() self.closing = true end
+    function pipe:write(_, callback) if callback then callback(nil) end end
+    table.insert(delayed_codex_pipes, pipe)
+    return pipe
+  end,
+  spawn = function(_, _, on_exit)
+    delayed_codex_exit = on_exit
+    local process = { closing = false }
+    function process:is_closing() return self.closing end
+    function process:close() self.closing = true end
+    function process:kill() end
+    return process
+  end,
+}
+local delayed_codex = CodexAdapter.new {
+  provider = providers.codex,
+  uv = delayed_codex_uv,
+  command_runner = function() return { code = 0 } end,
+  schedule = function(callback) callback() end,
+}
+delayed_codex:prompt('delayed stop', function() end)
+local delayed_codex_stopped = false
+delayed_codex:stop(function() delayed_codex_stopped = true end)
+assert_equal(delayed_codex_stopped, false, 'Codex stop waits for process exit')
+delayed_codex_exit(0)
+assert_equal(delayed_codex_stopped, false, 'Codex stop waits for stdout/stderr cleanup after exit')
+delayed_codex_pipes[2].reader(nil, nil)
+delayed_codex_pipes[3].reader(nil, nil)
+assert_equal(delayed_codex_stopped, true, 'Codex stop completes after exit and pipe cleanup')
+end)()
 
 local function decode_cursor_json(value)
   local position = 1
@@ -514,6 +564,7 @@ assert_equal(cursor_capabilities.fallback_protocol, 'terminal', 'Cursor reports 
 
 cursor_adapter:prompt('--not-a-Cursor-option', function(event) table.insert(cursor_events, event) end)
 assert_equal(cursor_spawn.executable, 'cursor-agent', 'Cursor executable')
+assert_equal(cursor_spawn.options.env, nil, 'Cursor child receives no Pi-specific environment override')
 assert_equal(
   table.concat(cursor_spawn.options.args, ' '),
   '--print --output-format stream-json --stream-partial-output --mode ask -- --not-a-Cursor-option',
@@ -664,6 +715,46 @@ assert_equal(spawn_fallbacks, 1, 'Cursor spawn failure opens terminal fallback')
 assert_equal(spawn_failure_events[1].kind, 'error', 'Cursor spawn failure emits an error')
 assert(spawn_failure_events[1].payload.message:find('spawn failed', 1, true), 'Cursor spawn failure preserves the spawn error')
 
+;(function()
+local delayed_cursor_pipes = {}
+local delayed_cursor_exit
+local delayed_cursor_uv = {
+  cwd = function() return '/workspace' end,
+  read_start = function(pipe, callback) pipe.reader = callback end,
+  new_pipe = function()
+    local pipe = { closing = false }
+    function pipe:is_closing() return self.closing end
+    function pipe:close() self.closing = true end
+    table.insert(delayed_cursor_pipes, pipe)
+    return pipe
+  end,
+  spawn = function(_, _, on_exit)
+    delayed_cursor_exit = on_exit
+    local process = { closing = false }
+    function process:is_closing() return self.closing end
+    function process:close() self.closing = true end
+    function process:kill() end
+    return process
+  end,
+}
+local delayed_cursor = CursorAdapter.new {
+  provider = providers.cursor,
+  uv = delayed_cursor_uv,
+  command_runner = cursor_command_runner,
+  json_decode = decode_cursor_json,
+  schedule = function(callback) callback() end,
+}
+delayed_cursor:prompt('delayed stop', function() end)
+local delayed_cursor_stopped = false
+delayed_cursor:stop(function() delayed_cursor_stopped = true end)
+assert_equal(delayed_cursor_stopped, false, 'Cursor stop waits for process exit')
+delayed_cursor_exit(0)
+assert_equal(delayed_cursor_stopped, false, 'Cursor stop waits for stdout/stderr cleanup after exit')
+delayed_cursor_pipes[1].reader(nil, nil)
+delayed_cursor_pipes[2].reader(nil, nil)
+assert_equal(delayed_cursor_stopped, true, 'Cursor stop completes after exit and pipe cleanup')
+end)()
+
 assert_equal(config.set_active('cursor'), true, 'persisting a known active agent')
 assert_equal(config.active(), 'cursor', 'persisted active agent')
 local active_changed, active_error = config.set_active('missing')
@@ -723,6 +814,9 @@ local original_env = vim.env
 local original_schedule = vim.schedule
 local original_expand = vim.fn.expand
 local original_list_extend = vim.list_extend
+local original_json = vim.json
+local original_os_setenv = vim.uv.os_setenv
+local pi_environment_writes = {}
 vim.api = { nvim_create_user_command = function() end }
 vim.env = {}
 vim.schedule = function() end
@@ -731,16 +825,62 @@ vim.list_extend = function(target, values)
   return target
 end
 vim.fn.expand = function(value) return value == '~' and pi_home or value end
+vim.uv.os_setenv = function(name, value) table.insert(pi_environment_writes, name .. '=' .. value) end
+vim.json = {
+  decode = function(value)
+    local result = {}
+    for key, item in value:gmatch('"([^"]+)"%s*:%s*"([^"]*)"') do result[key] = item end
+    return result
+  end,
+  encode = function(value)
+    local fields = {}
+    for _, key in ipairs { 'auth_source', 'api_key', 'provider', 'model' } do
+      if value[key] ~= nil then table.insert(fields, ('"%s":"%s"'):format(key, value[key])) end
+    end
+    return '{' .. table.concat(fields, ',') .. '}'
+  end,
+}
+
+local pi_config_path = temp_data .. '/pi_config.json'
+local legacy_pi_config = assert(io.open(pi_config_path, 'wb'))
+legacy_pi_config:write '{"auth_source":"override","api_key":"legacy-secret","provider":"openai","model":"gpt-test"}'
+legacy_pi_config:close()
 package.loaded['custom.plugins.setup'] = nil
 local pi_setup = require 'custom.plugins.setup'
 assert_equal(pi_setup.has_base_auth(), true, 'setup reuses the existing Pi auth store')
-assert_equal(table.concat(pi_setup.get_pi_command 'rpc', ' '), 'pi --mode rpc', 'base auth needs no credential arguments')
+local migrated_pi_config = assert(pi_setup.load_config())
+assert_equal(migrated_pi_config.api_key, nil, 'legacy Pi API keys are removed in memory')
+assert_equal(migrated_pi_config.provider, 'openai', 'legacy Pi provider selection is retained')
+assert_equal(
+  table.concat(pi_setup.get_pi_command 'rpc', ' '),
+  'pi --mode rpc --provider openai --model gpt-test',
+  'Pi override retains only non-secret provider and model flags'
+)
+assert_equal(#pi_environment_writes, 0, 'Pi configuration never mutates the global Neovim environment')
+local migrated_pi_file = assert(io.open(pi_config_path, 'rb'))
+local migrated_pi_json = migrated_pi_file:read '*a'
+migrated_pi_file:close()
+assert(not migrated_pi_json:find('api_key', 1, true), 'legacy api_key field is removed from pi_config.json')
+assert(not migrated_pi_json:find('legacy-secret', 1, true), 'legacy API key value is removed from pi_config.json')
+assert_equal(pi_setup.save_config {
+  auth_source = 'override',
+  api_key = 'new-secret-must-not-persist',
+  provider = 'anthropic',
+  model = 'claude-test',
+}, true, 'saving Pi configuration sanitizes caller-owned tables')
+local sanitized_pi_file = assert(io.open(pi_config_path, 'rb'))
+local sanitized_pi_json = sanitized_pi_file:read '*a'
+sanitized_pi_file:close()
+assert(not sanitized_pi_json:find('api_key', 1, true), 'new API keys cannot be persisted in pi_config.json')
+assert(not sanitized_pi_json:find('new-secret-must-not-persist', 1, true), 'new API key values cannot be persisted')
 package.loaded['custom.plugins.setup'] = nil
 vim.api = original_api
 vim.env = original_env
 vim.schedule = original_schedule
 vim.list_extend = original_list_extend
 vim.fn.expand = original_expand
+vim.json = original_json
+vim.uv.os_setenv = original_os_setenv
 
 local created_terminals = {}
 package.preload['custom.plugins.setup'] = function()
@@ -834,6 +974,15 @@ registered_commands.AgentStart()
 registered_commands.AgentStop()
 registered_commands.AgentToggle()
 assert_equal(table.concat(command_calls, ','), 'select:cursor,start,stop,toggle', 'agent command routing')
+;(function()
+  local command_notifications = {}
+  local saved_notify = vim.notify
+  command_manager.select = function() return false, 'manager-owned unavailable notification' end
+  vim.notify = function(message) table.insert(command_notifications, message) end
+  registered_commands.AgentSelect()
+  vim.notify = saved_notify
+  assert_equal(#command_notifications, 0, 'AgentSelect does not duplicate manager-owned failure notifications')
+end)()
 package.loaded['custom.plugins.init'] = nil
 package.loaded['custom.agents.manager'] = nil
 package.preload['custom.agents.manager'] = nil
@@ -981,6 +1130,7 @@ function fake_api.nvim_buf_get_name() return '/tmp/example.lua' end
 function fake_api.nvim_get_current_buf() return 1 end
 
 local pipes = {}
+local pi_spawn_exit
 local fake_uv = {}
 function fake_uv.new_pipe()
   local pipe = { writes = {}, closing = false }
@@ -999,12 +1149,13 @@ function fake_uv.spawn(executable, options, on_exit)
   assert_equal(executable, 'pi', 'Pi RPC executable')
   assert_equal(options.args[1], '--mode', 'Pi RPC mode flag')
   assert_equal(options.args[2], 'rpc', 'Pi RPC mode')
+  assert_equal(options.env, nil, 'Pi does not require a harness-injected credential environment')
+  pi_spawn_exit = on_exit
   local process = { closing = false }
   function process:is_closing() return self.closing end
   function process:close() self.closing = true end
   function process:kill(signal)
     assert_equal(signal, 'sigterm', 'Pi stop signal')
-    on_exit(0)
   end
   return process
 end
@@ -1072,7 +1223,15 @@ assert_equal(changed_result, nil, 'changedtick rejects stale Pi suggestion')
 assert_equal(table.concat(buffer.lines, '\n'), 'local value = 1', 'stale suggestion leaves buffer unchanged')
 assert(notifications[#notifications].message:find('Buffer changed while Pi was working', 1, true), 'changedtick rejection warns')
 pi_adapter:accept_suggestions()
-pi_adapter:stop()
+local pi_stop_completed = false
+pi_adapter:stop(function() pi_stop_completed = true end)
+assert_equal(pi_stop_completed, false, 'Pi stop waits for process exit')
+assert_equal(pipes[1].closing, false, 'Pi stop waits before closing process pipes')
+pi_spawn_exit(0)
+assert_equal(pi_stop_completed, true, 'Pi stop completes after process exit and pipe cleanup')
+assert_equal(pipes[1].closing, true, 'Pi stop closes stdin before completing')
+assert_equal(pipes[2].closing, true, 'Pi stop closes stdout before completing')
+assert_equal(pipes[3].closing, true, 'Pi stop closes stderr before completing')
 
 local successful_spawn = fake_uv.spawn
 fake_uv.spawn = function() return nil, 'spawn failed' end
@@ -1104,21 +1263,34 @@ package.loaded['custom.agents.adapters.codex'] = nil
 local adapter_calls = {}
 local adapter_factories = { pi = 0, cursor = 0, codex = 0 }
 local adapter_behavior = {}
-local function fake_adapter(name)
+local adapter_instances = {}
+local function fake_adapter(name, options)
   local adapter
   adapter = {
-    start = function()
+    live = false,
+    on_exit = options and options.on_exit,
+    start = function(self)
       table.insert(adapter_calls, name .. ':start')
       if adapter_behavior[name] and adapter_behavior[name].start then
-        return adapter_behavior[name].start()
+        local started, reason = adapter_behavior[name].start()
+        self.live = started ~= false
+        return started, reason
       end
+      self.live = true
       return true
     end,
-    stop = function()
+    is_running = function(self) return self.live end,
+    stop = function(self, callback)
       table.insert(adapter_calls, name .. ':stop')
-      if adapter_behavior[name] and adapter_behavior[name].stop then
-        return adapter_behavior[name].stop()
+      local function completed(...)
+        self.live = false
+        if callback then callback(...) end
       end
+      if adapter_behavior[name] and adapter_behavior[name].stop then
+        return adapter_behavior[name].stop(completed)
+      end
+      completed(true)
+      return true
     end,
     prompt = function(_, text, callback)
       table.insert(adapter_calls, name .. ':prompt:' .. text)
@@ -1150,6 +1322,7 @@ local function fake_adapter(name)
     end,
     capabilities = function() return { provider = name, prompt = true } end,
   }
+  adapter_instances[name] = adapter
   return adapter
 end
 
@@ -1157,9 +1330,9 @@ for _, name in ipairs { 'pi', 'cursor', 'codex' } do
   local provider_name = name
   package.preload['custom.agents.adapters.' .. provider_name] = function()
     return {
-      new = function()
+      new = function(options)
         adapter_factories[provider_name] = adapter_factories[provider_name] + 1
-        return fake_adapter(provider_name)
+        return fake_adapter(provider_name, options)
       end,
     }
   end
@@ -1292,6 +1465,39 @@ assert_equal(manager.current(), 'pi', 'failed old stop keeps the active provider
 assert_equal(config.active(), 'pi', 'failed old stop does not persist the replacement')
 assert_equal(adapter_calls[calls_before_failed_switch + 1], 'pi:stop', 'switch attempts to stop old adapter')
 assert_equal(adapter_calls[calls_before_failed_switch + 2], nil, 'switch does not start replacement after failed stop')
+
+package.loaded['custom.agents.manager'] = nil
+manager = require 'custom.agents.manager'
+assert_equal(manager.start(), true, 'manager starts before delayed-exit switch')
+local delayed_stop_completion
+adapter_behavior.pi = {
+  stop = function(completed)
+    delayed_stop_completion = completed
+    return true
+  end,
+}
+local calls_before_delayed_switch = #adapter_calls
+selected, select_error = manager.select 'cursor'
+assert_equal(selected, true, 'manager accepts a switch while shutdown is pending')
+assert_equal(select_error, nil, 'pending switch has no immediate error')
+assert_equal(manager.current(), 'pi', 'manager retains old provider until shutdown completes')
+assert_equal(adapter_calls[calls_before_delayed_switch + 1], 'pi:stop', 'delayed switch signals old provider')
+assert_equal(adapter_calls[calls_before_delayed_switch + 2], nil, 'replacement does not start before old process exits')
+delayed_stop_completion(true)
+adapter_behavior.pi = nil
+assert_equal(manager.current(), 'cursor', 'manager changes provider after shutdown completion')
+assert_equal(adapter_calls[calls_before_delayed_switch + 2], 'cursor:start', 'replacement starts after old cleanup completes')
+
+local cursor_starts_before_crash = 0
+for _, call in ipairs(adapter_calls) do if call == 'cursor:start' then cursor_starts_before_crash = cursor_starts_before_crash + 1 end end
+adapter_instances.cursor.live = false
+adapter_instances.cursor.on_exit(17, false)
+assert_equal(manager.start(), true, 'AgentStart recovers after an unexpected adapter exit')
+local cursor_starts_after_crash = 0
+for _, call in ipairs(adapter_calls) do if call == 'cursor:start' then cursor_starts_after_crash = cursor_starts_after_crash + 1 end end
+assert_equal(cursor_starts_after_crash, cursor_starts_before_crash + 1, 'unexpected exit delegates a fresh adapter start')
+manager.stop()
+assert_equal(config.set_active('pi'), true, 'resetting active provider after delayed lifecycle tests')
 
 package.loaded['custom.agents.manager'] = nil
 manager = require 'custom.agents.manager'

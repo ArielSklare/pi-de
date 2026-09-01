@@ -20,6 +20,7 @@ local function default_dependencies(options)
     split = options.split or function(value) return vim.split(value, '\n', { plain = true }) end,
     trim = options.trim or vim.trim,
     get_filetype = options.get_filetype or function(bufnr) return vim.bo[bufnr].filetype or '' end,
+    on_exit = options.on_exit,
   }
 end
 
@@ -38,6 +39,7 @@ function PiAdapter.new(options)
     split = dependencies.split,
     trim = dependencies.trim,
     get_filetype = dependencies.get_filetype,
+    on_exit = dependencies.on_exit,
     process = nil,
     stdin = nil,
     stdout = nil,
@@ -49,6 +51,7 @@ function PiAdapter.new(options)
     stdout_buffer = '',
     stderr_buffer = '',
     settled_callback = nil,
+    stop_callbacks = {},
   }, PiAdapter)
 
   self.suggestion_ns = self.api.nvim_create_namespace 'pi_suggestions'
@@ -97,8 +100,12 @@ function PiAdapter:_consume_stdout(err, data)
   end
 end
 
+function PiAdapter:is_running()
+  return self.process ~= nil
+end
+
 function PiAdapter:start()
-  if self.process and not self.process:is_closing() then return true, nil end
+  if self:is_running() then return true, nil end
 
   local command = self.setup.get_pi_command 'rpc'
   local executable = table.remove(command, 1)
@@ -121,12 +128,16 @@ function PiAdapter:start()
     if process and not process:is_closing() then process:close() end
     self.process, self.stdin, self.stdout, self.stderr = nil, nil, nil, nil
     local was_stopping = self.stopping
+    local stop_callbacks = self.stop_callbacks
+    self.stop_callbacks = {}
     self.stopping = false
     self.schedule(function()
       if code ~= 0 and not was_stopping then
         local detail = self.stderr_buffer ~= '' and (': ' .. self.trim(self.stderr_buffer)) or ''
         self.notify('Pi agent exited with code ' .. code .. detail, self.levels.ERROR)
       end
+      if self.on_exit then self.on_exit(code, was_stopping) end
+      for _, callback in ipairs(stop_callbacks) do callback(true) end
     end)
   end)
 
@@ -148,11 +159,26 @@ function PiAdapter:start()
   return true, nil
 end
 
-function PiAdapter:stop()
-  if self.process and not self.process:is_closing() then
-    self.stopping = true
-    self.process:kill 'sigterm'
+function PiAdapter:stop(callback)
+  if callback then table.insert(self.stop_callbacks, callback) end
+  if not self:is_running() then
+    local callbacks = self.stop_callbacks
+    self.stop_callbacks = {}
+    for _, completed in ipairs(callbacks) do completed(true) end
+    return true
   end
+  if not self.stopping then
+    self.stopping = true
+    local ok, reason = pcall(self.process.kill, self.process, 'sigterm')
+    if not ok then
+      self.stopping = false
+      local callbacks = self.stop_callbacks
+      self.stop_callbacks = {}
+      for _, completed in ipairs(callbacks) do completed(false, tostring(reason)) end
+      return false, tostring(reason)
+    end
+  end
+  return true
 end
 
 function PiAdapter:request(command_type, params, callback)

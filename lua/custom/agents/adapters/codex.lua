@@ -29,6 +29,19 @@ local function error_message(value)
   return detail
 end
 
+local function trim(message)
+  return tostring(message or ''):gsub('^%s+', ''):gsub('%s+$', '')
+end
+
+local function is_auth_error(message)
+  local lowered = tostring(message or ''):lower()
+  return lowered:find('not logged', 1, true)
+    or lowered:find('not authenticated', 1, true)
+    or lowered:find('authentication required', 1, true)
+    or lowered:find('login required', 1, true)
+    or lowered:find('unauthorized', 1, true)
+end
+
 function CodexAdapter.new(options)
   options = options or {}
   local provider = options.provider or {}
@@ -61,6 +74,7 @@ function CodexAdapter.new(options)
     stderr_eof = false,
     exit_code = nil,
     error_emitted = false,
+    stop_callbacks = {},
   }, CodexAdapter)
 end
 
@@ -72,12 +86,19 @@ function CodexAdapter:_run(arguments, timeout)
   return type(result) == 'table' and result or { code = 1, stderr = 'invalid command result' }
 end
 
+function CodexAdapter:is_running()
+  return self.started
+end
+
 function CodexAdapter:start()
   if self.started then return true, nil end
 
   local auth = self:_run({ 'login', 'status' }, self.auth_timeout)
   if auth.code ~= 0 then
-    return false, "Codex is not authenticated; run 'codex login'"
+    local message = trim((auth.stderr and auth.stderr ~= '' and auth.stderr) or auth.stdout)
+    if is_auth_error(message) then return false, "Codex is not authenticated; run 'codex login'" end
+    if message == '' then message = 'exit code ' .. tostring(auth.code) end
+    return false, 'Codex login status check failed: ' .. message
   end
 
   -- app-server transport is planned but not implemented; report the transport
@@ -209,6 +230,13 @@ function CodexAdapter:_maybe_finalize()
   self.process, self.stdin, self.stdout, self.stderr = nil, nil, nil, nil
   self.callback = nil
   self.stopping = false
+  local stop_callbacks = self.stop_callbacks
+  self.stop_callbacks = {}
+  if #stop_callbacks > 0 then
+    self.schedule(function()
+      for _, callback in ipairs(stop_callbacks) do callback(true) end
+    end)
+  end
 end
 
 function CodexAdapter:_consume_stdout(err, data)
@@ -302,12 +330,27 @@ function CodexAdapter:prompt(text, callback)
   end)
 end
 
-function CodexAdapter:stop()
+function CodexAdapter:stop(callback)
   self.started = false
-  if self.process and not self.process:is_closing() then
-    self.stopping = true
-    self.process:kill 'sigterm'
+  if callback then table.insert(self.stop_callbacks, callback) end
+  if not self.process then
+    local callbacks = self.stop_callbacks
+    self.stop_callbacks = {}
+    for _, completed in ipairs(callbacks) do completed(true) end
+    return true
   end
+  if not self.stopping and not self.process:is_closing() then
+    self.stopping = true
+    local ok, reason = pcall(self.process.kill, self.process, 'sigterm')
+    if not ok then
+      self.stopping = false
+      local callbacks = self.stop_callbacks
+      self.stop_callbacks = {}
+      for _, completed in ipairs(callbacks) do completed(false, tostring(reason)) end
+      return false, tostring(reason)
+    end
+  end
+  return true
 end
 
 function CodexAdapter:capabilities()

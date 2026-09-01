@@ -22,8 +22,7 @@ vim.api.nvim_create_user_command('AgentSelect', function()
     format_item = function(name) return display_names[name] end,
   }, function(name)
     if not name then return end
-    local selected, reason = manager.select(name)
-    if not selected then vim.notify(reason, vim.log.levels.ERROR) end
+    manager.select(name)
   end)
 end, { desc = 'Select the active agent provider' })
 
