@@ -1,5 +1,6 @@
 -- First-start configuration for the Pi agent integration.
 -- Pi's own auth store (~/.pi/agent/auth.json) is preferred and never copied here.
+-- Legacy provider overrides stay Pi-only and are never copied into agent_harness.json.
 local uv = vim.uv or vim.loop
 local M = {}
 

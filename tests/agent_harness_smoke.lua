@@ -186,6 +186,263 @@ assert(normalized_persisted_all_disabled.agents.pi.enabled == true, 'all-disable
 
 assert_equal(config.save(config_with_secrets), true, 'restoring sanitized harness configuration')
 
+local pi_home = temp_data .. '/home'
+os.execute(('mkdir -p %q'):format(pi_home .. '/.pi/agent'))
+local base_auth = assert(io.open(pi_home .. '/.pi/agent/auth.json', 'wb'))
+base_auth:write '{"provider":"existing-login"}\n'
+base_auth:close()
+local original_api = vim.api
+local original_env = vim.env
+local original_schedule = vim.schedule
+local original_expand = vim.fn.expand
+local original_list_extend = vim.list_extend
+vim.api = { nvim_create_user_command = function() end }
+vim.env = {}
+vim.schedule = function() end
+vim.list_extend = function(target, values)
+  for _, value in ipairs(values) do table.insert(target, value) end
+  return target
+end
+vim.fn.expand = function(value) return value == '~' and pi_home or value end
+package.loaded['custom.plugins.setup'] = nil
+local pi_setup = require 'custom.plugins.setup'
+assert_equal(pi_setup.has_base_auth(), true, 'setup reuses the existing Pi auth store')
+assert_equal(table.concat(pi_setup.get_pi_command 'rpc', ' '), 'pi --mode rpc', 'base auth needs no credential arguments')
+package.loaded['custom.plugins.setup'] = nil
+vim.api = original_api
+vim.env = original_env
+vim.schedule = original_schedule
+vim.list_extend = original_list_extend
+vim.fn.expand = original_expand
+
+local function decode_json_string(value)
+  local result = {}
+  local index = 1
+  while index <= #value do
+    local character = value:sub(index, index)
+    if character ~= '\\' then
+      table.insert(result, character)
+      index = index + 1
+    else
+      local escaped = value:sub(index + 1, index + 1)
+      local replacements = { n = '\n', r = '\r', t = '\t', ['"'] = '"', ['\\'] = '\\' }
+      assert(replacements[escaped], 'unsupported JSON escape in Pi fixture: ' .. escaped)
+      table.insert(result, replacements[escaped])
+      index = index + 2
+    end
+  end
+  return table.concat(result)
+end
+
+local function decode_pi_json(value)
+  if value == 'this is not json' then error 'invalid JSON' end
+
+  local replacement = value:match '^%{"newText":"(.*)"%}$'
+  if replacement then return { newText = decode_json_string(replacement) } end
+
+  local kind = value:match '"type":"([^"]+)"'
+  assert(kind, 'missing Pi fixture message type')
+  local message = {
+    type = kind,
+    id = value:match '"id":"([^"]+)"',
+    success = value:match '"success":true' ~= nil,
+  }
+  if value:match '"accepted":true' then message.data = { accepted = true } end
+  local text = value:match '"text":"(.*)"}}$'
+  if text then message.data = { text = decode_json_string(text) } end
+  return message
+end
+
+local function encode_pi_json(value)
+  local fields = {
+    ('"id":"%s"'):format(value.id),
+    ('"type":"%s"'):format(value.type),
+  }
+  if value.message then
+    local escaped = value.message:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n')
+    table.insert(fields, ('"message":"%s"'):format(escaped))
+  end
+  return '{' .. table.concat(fields, ',') .. '}'
+end
+
+local fixture_lines = {}
+for line in assert(io.lines 'tests/fixtures/pi-events.jsonl') do
+  table.insert(fixture_lines, line)
+end
+assert_equal(#fixture_lines, 5, 'Pi fixture event count')
+
+local buffer = {
+  lines = { 'local value = 1' },
+  changedtick = 7,
+  clears = 0,
+  extmarks = {},
+}
+local fake_api = {}
+function fake_api.nvim_create_namespace(name)
+  assert_equal(name, 'pi_suggestions', 'Pi suggestion namespace')
+  return 41
+end
+function fake_api.nvim_buf_is_valid(bufnr) return bufnr == 1 end
+function fake_api.nvim_buf_get_lines(_, start_line, end_line)
+  local result = {}
+  for index = start_line + 1, end_line do table.insert(result, buffer.lines[index]) end
+  return result
+end
+function fake_api.nvim_buf_set_lines(_, start_line, end_line, _, lines)
+  local updated = {}
+  for index = 1, start_line do table.insert(updated, buffer.lines[index]) end
+  for _, line in ipairs(lines) do table.insert(updated, line) end
+  for index = end_line + 1, #buffer.lines do table.insert(updated, buffer.lines[index]) end
+  buffer.lines = updated
+  buffer.changedtick = buffer.changedtick + 1
+end
+function fake_api.nvim_buf_clear_namespace(_, namespace)
+  assert_equal(namespace, 41, 'cleared Pi suggestion namespace')
+  buffer.clears = buffer.clears + 1
+  buffer.extmarks = {}
+end
+function fake_api.nvim_buf_set_extmark(_, namespace, line, column, options)
+  assert_equal(namespace, 41, 'Pi highlight namespace')
+  table.insert(buffer.extmarks, { line = line, column = column, group = options.line_hl_group })
+end
+function fake_api.nvim_buf_get_changedtick() return buffer.changedtick end
+function fake_api.nvim_buf_line_count() return #buffer.lines end
+function fake_api.nvim_buf_get_name() return '/tmp/example.lua' end
+function fake_api.nvim_get_current_buf() return 1 end
+
+local pipes = {}
+local fake_uv = {}
+function fake_uv.new_pipe()
+  local pipe = { writes = {}, closing = false }
+  function pipe:is_closing() return self.closing end
+  function pipe:close() self.closing = true end
+  function pipe:write(value, callback)
+    table.insert(self.writes, value)
+    if callback then callback(nil) end
+  end
+  table.insert(pipes, pipe)
+  return pipe
+end
+function fake_uv.cwd() return '/tmp' end
+function fake_uv.read_start(pipe, callback) pipe.reader = callback end
+function fake_uv.spawn(executable, options, on_exit)
+  assert_equal(executable, 'pi', 'Pi RPC executable')
+  assert_equal(options.args[1], '--mode', 'Pi RPC mode flag')
+  assert_equal(options.args[2], 'rpc', 'Pi RPC mode')
+  local process = { closing = false }
+  function process:is_closing() return self.closing end
+  function process:close() self.closing = true end
+  function process:kill(signal)
+    assert_equal(signal, 'sigterm', 'Pi stop signal')
+    on_exit(0)
+  end
+  return process
+end
+
+local notifications = {}
+local PiAdapter = require 'custom.agents.adapters.pi'
+local pi_adapter = PiAdapter.new {
+  api = fake_api,
+  uv = fake_uv,
+  setup = { get_pi_command = function() return { 'pi', '--mode', 'rpc' } end },
+  json_decode = decode_pi_json,
+  json_encode = encode_pi_json,
+  schedule = function(callback) callback() end,
+  notify = function(message, level) table.insert(notifications, { message = message, level = level }) end,
+  levels = { ERROR = 'ERROR', WARN = 'WARN', INFO = 'INFO' },
+  split = function(value)
+    local result = {}
+    for line in (value .. '\n'):gmatch '(.-)\n' do table.insert(result, line) end
+    return result
+  end,
+  trim = function(value) return value:match '^%s*(.-)%s*$' end,
+  get_filetype = function() return 'lua' end,
+}
+
+local capabilities = pi_adapter:capabilities()
+assert_equal(capabilities.provider, 'pi', 'Pi adapter provider capability')
+assert_equal(capabilities.prompt, true, 'Pi adapter prompt capability')
+assert_equal(capabilities.suggestions, true, 'Pi adapter suggestion capability')
+
+local prompt_data
+pi_adapter:prompt('hello', function(data) prompt_data = data end)
+local stdin = pipes[1]
+local stdout = pipes[2]
+assert(stdin.writes[1]:find('"id":"1"', 1, true), 'first Pi request keeps string ID 1')
+assert(stdin.writes[1]:find('"type":"prompt"', 1, true), 'Pi prompt keeps JSONL RPC type')
+stdout.reader(nil, fixture_lines[1]:gsub('"1"', '"99"', 1) .. '\n')
+assert_equal(prompt_data, nil, 'unmatched Pi response is not correlated')
+stdout.reader(nil, fixture_lines[1] .. '\n' .. fixture_lines[2] .. '\n')
+assert_equal(prompt_data.accepted, true, 'matching Pi response is correlated')
+assert(notifications[#notifications].message:find('Invalid Pi RPC response', 1, true) ~= nil, 'invalid Pi JSON warns')
+
+local suggestion_result = false
+pi_adapter:suggest_edits(1, 0, 1, function(result) suggestion_result = result end)
+assert(stdin.writes[2]:find('"id":"2"', 1, true), 'suggestion prompt keeps sequential request ID')
+stdout.reader(nil, fixture_lines[3] .. '\n')
+stdout.reader(nil, fixture_lines[4] .. '\n')
+assert(stdin.writes[3]:find('"id":"3"', 1, true), 'settled event requests last assistant text')
+assert(stdin.writes[3]:find('"type":"get_last_assistant_text"', 1, true), 'settled event keeps Pi RPC command')
+stdout.reader(nil, fixture_lines[5] .. '\n')
+assert_equal(suggestion_result, true, 'valid JSON replacement is applied')
+assert_equal(table.concat(buffer.lines, '\n'), 'local value = 2\nreturn value', 'replacement text decoding')
+assert_equal(#buffer.extmarks, 2, 'every suggested replacement line is highlighted')
+assert_equal(buffer.extmarks[1].group, 'PiSuggestion', 'Pi suggestion highlight group')
+pi_adapter:discard_suggestions()
+assert_equal(table.concat(buffer.lines, '\n'), 'local value = 1', 'discard restores original lines')
+assert_equal(#buffer.extmarks, 0, 'discard clears suggestion highlights')
+
+local changed_result = true
+pi_adapter:suggest_edits(1, 0, 1, function(result) changed_result = result end)
+stdout.reader(nil, '{"type":"response","id":"4","success":true,"data":{"accepted":true}}\n')
+stdout.reader(nil, '{"type":"agent_settled"}\n')
+buffer.changedtick = buffer.changedtick + 1
+stdout.reader(nil, fixture_lines[5]:gsub('"3"', '"5"', 1) .. '\n')
+assert_equal(changed_result, nil, 'changedtick rejects stale Pi suggestion')
+assert_equal(table.concat(buffer.lines, '\n'), 'local value = 1', 'stale suggestion leaves buffer unchanged')
+assert(notifications[#notifications].message:find('Buffer changed while Pi was working', 1, true), 'changedtick rejection warns')
+pi_adapter:accept_suggestions()
+pi_adapter:stop()
+
+package.loaded['custom.agents.adapters.pi'] = nil
+local compatibility_calls = {}
+local compatibility_adapter = {
+  start = function() table.insert(compatibility_calls, 'start'); return true end,
+  stop = function() table.insert(compatibility_calls, 'stop') end,
+  suggest_edits = function(_, bufnr, start_line, end_line)
+    table.insert(compatibility_calls, ('suggest:%d:%d:%d'):format(bufnr, start_line, end_line))
+  end,
+  accept_suggestions = function() table.insert(compatibility_calls, 'accept') end,
+  discard_suggestions = function() table.insert(compatibility_calls, 'discard') end,
+}
+package.preload['custom.agents.adapters.pi'] = function()
+  return { new = function() return compatibility_adapter end }
+end
+package.preload['custom.plugins.setup'] = function()
+  return { get_pi_command = function() return { 'pi', '--mode', 'rpc' } end }
+end
+original_api = vim.api
+local compatibility_commands = {}
+vim.api = {
+  nvim_create_namespace = function() return 42 end,
+  nvim_set_hl = function() end,
+  nvim_create_user_command = function(name, callback) compatibility_commands[name] = callback end,
+  nvim_buf_line_count = function() return 12 end,
+}
+package.loaded['custom.plugins.pi'] = nil
+local pi_facade = require 'custom.plugins.pi'
+compatibility_commands.PiStart()
+compatibility_commands.PiStop()
+compatibility_commands.PiSuggest { range = 1, line1 = 3, line2 = 5, buf = 9 }
+compatibility_commands.PiAccept()
+compatibility_commands.PiDiscard()
+assert_equal(table.concat(compatibility_calls, ','), 'start,stop,suggest:9:2:5,accept,discard', 'Pi commands delegate to adapter')
+assert_equal(pi_facade.adapter(), compatibility_adapter, 'Pi compatibility facade exposes its adapter')
+vim.api = original_api
+package.loaded['custom.plugins.pi'] = nil
+package.loaded['custom.agents.adapters.pi'] = nil
+package.preload['custom.plugins.setup'] = nil
+
 local adapter_calls = {}
 local adapter_factories = { pi = 0, cursor = 0, codex = 0 }
 local adapter_behavior = {}
