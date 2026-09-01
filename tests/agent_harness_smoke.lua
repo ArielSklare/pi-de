@@ -143,7 +143,25 @@ config_with_secrets.api_key = 'must-not-be-saved'
 config_with_secrets.agents.pi.token = 'must-not-be-saved'
 assert_equal(config.save(config_with_secrets), true, 'saving sanitized harness configuration')
 
+assert_equal(config.save {
+  active_agent = 'cursor',
+  agents = {
+    pi = { enabled = true },
+    cursor = { enabled = false },
+    codex = { enabled = true },
+  },
+}, true, 'saving a disabled requested active agent')
+assert_equal(config.active(), 'pi', 'save falls back from a disabled requested active agent')
+
 local config_path = temp_data .. '/agent_harness.json'
+local invalid_config = assert(io.open(config_path, 'wb'))
+invalid_config:write '{"active_agent":"pi","agents":{"pi":{"enabled":false},"cursor":{"enabled":true},"codex":{"enabled":true}}}\n'
+invalid_config:close()
+local normalized_persisted_config = config.load()
+assert_equal(normalized_persisted_config.active_agent, 'cursor', 'load falls back from a persisted disabled active agent')
+assert_equal(normalized_persisted_config.agents.pi.enabled, false, 'load preserves normalized provider enablement')
+
+assert_equal(config.save(config_with_secrets), true, 'restoring sanitized harness configuration')
 local config_file = assert(io.open(config_path, 'rb'))
 local saved_config = config_file:read '*a'
 config_file:close()

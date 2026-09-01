@@ -20,12 +20,23 @@ local function normalize(value)
   local result = defaults()
   if type(value) ~= 'table' then return result end
 
-  if known_providers[value.active_agent] then result.active_agent = value.active_agent end
   if type(value.agents) == 'table' then
     for _, name in ipairs(provider_names) do
       local agent = value.agents[name]
       if type(agent) == 'table' and type(agent.enabled) == 'boolean' then
         result.agents[name].enabled = agent.enabled
+      end
+    end
+  end
+
+  local requested = value.active_agent
+  if known_providers[requested] and result.agents[requested].enabled then
+    result.active_agent = requested
+  else
+    for _, name in ipairs(provider_names) do
+      if result.agents[name].enabled then
+        result.active_agent = name
+        break
       end
     end
   end
