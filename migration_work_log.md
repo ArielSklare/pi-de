@@ -52,3 +52,24 @@ Started: 2026-08-31T15:18:00+03:00
 - Files changed: init.lua, nvim-pack-lock.json, migration_work_log.md
 - Git commit: efaaacb
 - Timestamp: 2026-08-31T15:20:17+03:00
+
+---
+
+## Task: Document and verify the generic agent harness (Task 7)
+Started: 2026-09-01T13:41:50+03:00
+
+### Documentation
+- Status: ✅ Complete with validation limitations
+- Summary: Reframed the README around the generic Pi, Cursor Agent, and Codex harness. Added secret-free installation/authentication prerequisites; documented `:AgentSelect`, `:AgentToggle`, `:AgentStart`, and `:AgentStop`; retained Pi-only compatibility commands; and recorded current provider protocol, approval, structured-edit, and session/resume differences. Documented that the generic harness state contains no credentials.
+- Files changed: README.md, migration_work_log.md, .superpowers/sdd/2026-09-01-generic-agent-harness/task-7-report.md
+
+### Validation results
+- `lua tests/agent_harness_smoke.lua`: ✅ PASS (`agent_harness_smoke: PASS`). This Lua-hosted suite includes simulated present/absent executable handling and unauthenticated Cursor/Codex startup behavior; it is not native Neovim startup evidence.
+- `luac -p` over all 12 `lua/custom/**/*.lua` files plus `tests/agent_harness_smoke.lua`: ✅ PASS.
+- `pi --version`: ✅ PASS — `0.84.4`.
+- `cursor-agent --version`: ✅ PASS — `2026.08.31-4057e58`.
+- `codex --version`: ✅ PASS — `codex-cli 0.152.0`; the CLI also printed a non-fatal warning that a stale arg0 temporary directory was not empty.
+- `stylua --check lua/custom tests/agent_harness_smoke.lua`: ❌ FAIL — the pre-existing Lua files and smoke test differ from StyLua's default formatting. Task 7 does not change Lua, so no formatting rewrite was made.
+- `nvim --headless -c 'qa!'`: ⚠️ BLOCKED — `nvim` is not installed/on `PATH`; startup with providers present, absent, and unauthenticated could not be validated natively.
+- `nvim --headless -u NONE -l tests/agent_harness_smoke.lua`: ⚠️ BLOCKED — `nvim` is not installed/on `PATH`; no native Neovim smoke pass is claimed.
+- Timestamp: 2026-09-01T13:41:50+03:00
