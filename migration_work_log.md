@@ -55,6 +55,20 @@ Started: 2026-08-31T15:18:00+03:00
 
 ---
 
+## Task: Add curated Sofia models to the embedded Pi agent
+Started: 2026-08-31T15:30:00+03:00
+
+---
+
+## Step 1: Register and validate Sofia models
+- Status: ✅ Complete
+- Summary: Queried Sofia's authenticated model catalog, selected 11 coding-suitable models across heavy, balanced, and inexpensive tiers, and registered complete capability metadata in Pi. Kept Sofia's Responses API for GPT-5.6 Sol/Terra/Luna and routed other models through its Chat Completions API. Corrected GPT-5.6 reasoning and image capabilities. Smoke tests passed for Sol, Claude Sonnet 4.6, and Luna.
+- Files changed: ~/.pi/agent/models.json, migration_work_log.md
+- Git commit: skipped - runtime Pi configuration and log-only repository change
+- Timestamp: 2026-08-31T15:37:02+03:00
+
+---
+
 ## Task: Document and verify the generic agent harness (Task 7)
 Started: 2026-09-01T13:41:50+03:00
 
@@ -70,6 +84,6 @@ Started: 2026-09-01T13:41:50+03:00
 - `cursor-agent --version`: ✅ PASS — `2026.08.31-4057e58`.
 - `codex --version`: ✅ PASS — `codex-cli 0.152.0`; the CLI also printed a non-fatal warning that a stale arg0 temporary directory was not empty.
 - `stylua --check lua/custom tests/agent_harness_smoke.lua`: ❌ FAIL — the pre-existing Lua files and smoke test differ from StyLua's default formatting. Task 7 does not change Lua, so no formatting rewrite was made.
-- `nvim --headless -c 'qa!'`: ⚠️ BLOCKED — `nvim` is not installed/on `PATH`; startup with providers present, absent, and unauthenticated could not be validated natively.
-- `nvim --headless -u NONE -l tests/agent_harness_smoke.lua`: ⚠️ BLOCKED — `nvim` is not installed/on `PATH`; no native Neovim smoke pass is claimed.
+- `nvim --headless -c 'qa!'`: ⚠️ BLOCKED — `nvim` is installed as a Zsh alias but is not available in non-interactive PATH; full native startup later passed through interactive Zsh.
+- `nvim --headless -u NONE -l tests/agent_harness_smoke.lua`: ⚠️ BLOCKED — the native test harness is incompatible with the installed Neovim 0.12.5 runtime (`vim._init_packages` calls unavailable `nvim__get_runtime`); no native smoke pass is claimed.
 - Timestamp: 2026-09-01T13:41:50+03:00
