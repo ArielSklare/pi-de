@@ -404,50 +404,36 @@ assert(notifications[#notifications].message:find('Buffer changed while Pi was w
 pi_adapter:accept_suggestions()
 pi_adapter:stop()
 
-package.loaded['custom.agents.adapters.pi'] = nil
-local compatibility_calls = {}
-local compatibility_adapter = {
-  start = function() table.insert(compatibility_calls, 'start'); return true end,
-  stop = function() table.insert(compatibility_calls, 'stop') end,
-  suggest_edits = function(_, bufnr, start_line, end_line)
-    table.insert(compatibility_calls, ('suggest:%d:%d:%d'):format(bufnr, start_line, end_line))
-  end,
-  accept_suggestions = function() table.insert(compatibility_calls, 'accept') end,
-  discard_suggestions = function() table.insert(compatibility_calls, 'discard') end,
+local successful_spawn = fake_uv.spawn
+fake_uv.spawn = function() return nil, 'spawn failed' end
+local failed_adapter = PiAdapter.new {
+  api = fake_api,
+  uv = fake_uv,
+  setup = { get_pi_command = function() return { 'pi', '--mode', 'rpc' } end },
+  json_decode = decode_pi_json,
+  json_encode = encode_pi_json,
+  schedule = function(callback) callback() end,
+  notify = function() end,
+  levels = { ERROR = 'ERROR' },
+  split = function(value) return { value } end,
+  trim = function(value) return value end,
+  get_filetype = function() return 'lua' end,
 }
-package.preload['custom.agents.adapters.pi'] = function()
-  return { new = function() return compatibility_adapter end }
+local failed_start, failed_reason = failed_adapter:start()
+assert_equal(failed_start, false, 'failed Pi spawn is reported')
+assert_equal(failed_reason, 'spawn failed', 'failed Pi spawn reason is preserved')
+for index = #pipes - 2, #pipes do
+  assert(pipes[index].closing == true, 'failed Pi spawn closes allocated pipe ' .. index)
 end
-package.preload['custom.plugins.setup'] = function()
-  return { get_pi_command = function() return { 'pi', '--mode', 'rpc' } end }
-end
-original_api = vim.api
-local compatibility_commands = {}
-vim.api = {
-  nvim_create_namespace = function() return 42 end,
-  nvim_set_hl = function() end,
-  nvim_create_user_command = function(name, callback) compatibility_commands[name] = callback end,
-  nvim_buf_line_count = function() return 12 end,
-}
-package.loaded['custom.plugins.pi'] = nil
-local pi_facade = require 'custom.plugins.pi'
-compatibility_commands.PiStart()
-compatibility_commands.PiStop()
-compatibility_commands.PiSuggest { range = 1, line1 = 3, line2 = 5, buf = 9 }
-compatibility_commands.PiAccept()
-compatibility_commands.PiDiscard()
-assert_equal(table.concat(compatibility_calls, ','), 'start,stop,suggest:9:2:5,accept,discard', 'Pi commands delegate to adapter')
-assert_equal(pi_facade.adapter(), compatibility_adapter, 'Pi compatibility facade exposes its adapter')
-vim.api = original_api
-package.loaded['custom.plugins.pi'] = nil
+fake_uv.spawn = successful_spawn
+
 package.loaded['custom.agents.adapters.pi'] = nil
-package.preload['custom.plugins.setup'] = nil
 
 local adapter_calls = {}
 local adapter_factories = { pi = 0, cursor = 0, codex = 0 }
 local adapter_behavior = {}
 local function fake_adapter(name)
-  return {
+  local adapter = {
     start = function()
       table.insert(adapter_calls, name .. ':start')
       if adapter_behavior[name] and adapter_behavior[name].start then
@@ -468,8 +454,23 @@ local function fake_adapter(name)
       end
       if callback then callback(name .. ':reply') end
     end,
+    request = function(_, command_type, params, callback)
+      table.insert(adapter_calls, name .. ':request:' .. command_type .. ':' .. tostring(params.value))
+      if callback then callback(name .. ':request-reply') end
+    end,
+    _apply_suggested_edit = function(_, bufnr, edit, callback)
+      table.insert(adapter_calls, ('%s:apply:%d:%s'):format(name, bufnr, edit.newText))
+      if callback then callback(true) end
+    end,
+    suggest_edits = function(_, bufnr, start_line, end_line, callback)
+      table.insert(adapter_calls, ('%s:suggest:%d:%d:%d'):format(name, bufnr, start_line, end_line))
+      if callback then callback(true) end
+    end,
+    accept_suggestions = function() table.insert(adapter_calls, name .. ':accept') end,
+    discard_suggestions = function() table.insert(adapter_calls, name .. ':discard') end,
     capabilities = function() return { provider = name, prompt = true } end,
   }
+  return adapter
 end
 
 for _, name in ipairs { 'pi', 'cursor', 'codex' } do
@@ -599,6 +600,49 @@ vim.fn.executable = original_executable
 assert_equal(prompt_ok, true, 'prompt exceptions do not escape the manager')
 assert(type(prompt_error) == 'string' and prompt_error:find('prompt exploded', 1, true), 'prompt exception reaches callback')
 assert(type(notifications[1]) == 'string' and notifications[1]:find('prompt exploded', 1, true), 'prompt exception notifies')
+
+manager.stop()
+assert_equal(config.set_active('pi'), true, 'resetting active agent for Pi facade ownership test')
+package.loaded['custom.agents.manager'] = nil
+package.loaded['custom.plugins.pi'] = nil
+manager = require 'custom.agents.manager'
+local pi_factories_before_facade = adapter_factories.pi
+vim.fn.executable = function(command) return command == 'pi' and 1 or 0 end
+original_api = vim.api
+local compatibility_commands = {}
+vim.api = setmetatable({
+  nvim_create_user_command = function(name, callback) compatibility_commands[name] = callback end,
+  nvim_buf_line_count = function() return 12 end,
+}, { __index = original_api })
+local pi_facade = require 'custom.plugins.pi'
+local facade_adapter = pi_facade.adapter()
+assert_equal(facade_adapter, manager.adapter('pi'), 'Pi facade exposes the manager-owned adapter')
+assert_equal(adapter_factories.pi, pi_factories_before_facade + 1, 'manager and facade share one Pi adapter factory instance')
+
+local facade_calls_start = #adapter_calls
+assert_equal(manager.start(), true, 'manager starts the shared Pi adapter before compatibility commands')
+compatibility_commands.PiStart()
+pi_facade.pi_request('status', { value = 'one' }, function() end)
+pi_facade.apply_suggested_edit(9, { newText = 'replacement' }, function() end)
+compatibility_commands.PiSuggest { range = 1, line1 = 3, line2 = 5, buf = 9 }
+compatibility_commands.PiAccept()
+compatibility_commands.PiDiscard()
+compatibility_commands.PiStop()
+local facade_calls = {}
+for index = facade_calls_start + 1, #adapter_calls do table.insert(facade_calls, adapter_calls[index]) end
+assert_equal(table.concat(facade_calls, ','), table.concat({
+  'pi:start',
+  'pi:request:status:one',
+  'pi:apply:9:replacement',
+  'pi:suggest:9:2:5',
+  'pi:accept',
+  'pi:discard',
+  'pi:stop',
+}, ','), 'all Pi commands and wrappers share the manager lifecycle and adapter')
+assert_equal(adapter_factories.pi, pi_factories_before_facade + 1, 'Pi facade operations do not construct a second adapter')
+vim.api = original_api
+vim.fn.executable = original_executable
+package.loaded['custom.plugins.pi'] = nil
 
 local config_file = assert(io.open(config_path, 'rb'))
 local saved_config = config_file:read '*a'

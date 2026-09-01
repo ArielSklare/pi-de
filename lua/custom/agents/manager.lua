@@ -96,6 +96,13 @@ function M.current()
   return active_name
 end
 
+function M.adapter(expected_name)
+  if expected_name and expected_name ~= active_name then
+    return nil, ("Agent provider '%s' is not active"):format(expected_name)
+  end
+  return get_active_adapter()
+end
+
 function M.start()
   if state == 'running' then return true, nil end
   if state == 'starting' then return false, 'Active agent is already starting' end

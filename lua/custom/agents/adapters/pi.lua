@@ -1,6 +1,10 @@
 local PiAdapter = {}
 PiAdapter.__index = PiAdapter
 
+local function close_pipe(pipe)
+  if pipe and not pipe:is_closing() then pipe:close() end
+end
+
 local function default_dependencies(options)
   local api = options.api or vim.api
   local levels = options.levels or (vim.log and vim.log.levels) or {}
@@ -127,6 +131,9 @@ function PiAdapter:start()
   end)
 
   if not process then
+    close_pipe(self.stdin)
+    close_pipe(self.stdout)
+    close_pipe(self.stderr)
     self.process, self.stdin, self.stdout, self.stderr = nil, nil, nil, nil
     local reason = spawn_error or 'executable not found'
     self.notify('Failed to start Pi agent: ' .. reason, self.levels.ERROR)
