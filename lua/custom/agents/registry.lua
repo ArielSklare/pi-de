@@ -10,6 +10,7 @@ local providers = {
     command = { 'cursor-agent' },
     terminal_args = {},
     protocol = 'stream-json',
+    fallback_protocol = 'terminal',
   },
   codex = {
     command = { 'codex' },

@@ -1,0 +1,6 @@
+{"type":"system","subtype":"init","apiKeySource":"login","cwd":"/tmp/cursor-fixture","session_id":"session-fixture","model":"cursor-model","permissionMode":"default"}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"cursor fixture ready"}]},"session_id":"session-fixture","timestamp_ms":1788258459264}
+{"type":"tool_call","subtype":"started","call_id":"call-fixture","tool_call":{"readToolCall":{"args":{"path":"/tmp/cursor-fixture/input.txt"}},"toolCallId":"call-fixture"},"session_id":"session-fixture","timestamp_ms":1788258476852}
+{"type":"tool_call","subtype":"completed","call_id":"call-fixture","tool_call":{"readToolCall":{"args":{"path":"/tmp/cursor-fixture/input.txt"},"result":{"success":{"content":"fixture-tool-content\n"}}},"toolCallId":"call-fixture"},"session_id":"session-fixture","timestamp_ms":1788258477610}
+{"type":"result","subtype":"success","duration_ms":4600,"is_error":false,"result":"cursor fixture ready","session_id":"session-fixture","request_id":"request-fixture"}
+{"type":"result","subtype":"error","duration_ms":12,"is_error":true,"result":"Authentication required","session_id":"session-fixture","request_id":"request-auth"}

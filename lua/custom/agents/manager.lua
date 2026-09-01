@@ -51,6 +51,11 @@ local function create_adapter(name)
   local created, adapter = pcall(factory.new, {
     name = name,
     provider = registry.get(name),
+    open_terminal = function(provider_name)
+      local loaded, terminal = pcall(require, 'custom.agents.terminal')
+      if not loaded then return false, 'Agent terminal is unavailable: ' .. tostring(terminal) end
+      return terminal.open(provider_name)
+    end,
   })
   if not created then
     return nil, ("Agent provider '%s' adapter could not be created: %s"):format(name, adapter)

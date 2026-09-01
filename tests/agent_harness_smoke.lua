@@ -99,6 +99,7 @@ assert_equal(providers.pi.command[1], 'pi', 'Pi executable')
 assert_equal(providers.pi.protocol, 'rpc', 'Pi protocol')
 assert_equal(providers.cursor.command[1], 'cursor-agent', 'Cursor executable')
 assert_equal(providers.cursor.protocol, 'stream-json', 'Cursor protocol')
+assert_equal(providers.cursor.fallback_protocol, 'terminal', 'Cursor terminal fallback protocol')
 assert_equal(providers.codex.command[1], 'codex', 'Codex executable')
 assert_equal(providers.codex.protocol, 'exec-json', 'Codex active protocol')
 assert_equal(providers.codex.preferred_protocol, 'app-server', 'Codex future preferred protocol')
@@ -341,6 +342,146 @@ assert_equal(auth_started, false, 'unauthenticated Codex fails startup')
 assert(auth_error:find('codex login', 1, true), 'unauthenticated Codex gives login remedy')
 assert_equal(auth_checks, 1, 'unauthenticated Codex does not retry')
 assert_equal(#auth_notifications, 0, 'authentication failure notification is manager-owned')
+
+local function decode_cursor_json(value)
+  local result = {
+    type = assert(value:match '"type":"([^"]+)"', 'missing Cursor fixture event type'),
+    subtype = value:match '"subtype":"([^"]+)"',
+    session_id = value:match '"session_id":"([^"]+)"',
+    call_id = value:match '"call_id":"([^"]+)"',
+    timestamp_ms = tonumber(value:match '"timestamp_ms":(%d+)'),
+    is_error = value:match '"is_error":true' ~= nil,
+    result = value:match '"result":"([^"]+)"',
+  }
+  local text = value:match '"content":%[%{"type":"text","text":"([^"]*)"'
+  if text then result.message = { content = { { type = 'text', text = text } } } end
+  local tool_name = value:match '"tool_call":%{"([%w_]+)":'
+  if tool_name then
+    result.tool_call = { name = tool_name }
+    if value:match '"result":' then
+      result.tool_call.result = value:match '"content":"([^"]*)"'
+      if result.tool_call.result then result.tool_call.result = result.tool_call.result:gsub('\\n', '\n') end
+    end
+  end
+  return result
+end
+
+local cursor_fixture_lines = {}
+for line in assert(io.lines 'tests/fixtures/cursor-events.jsonl') do table.insert(cursor_fixture_lines, line) end
+assert_equal(#cursor_fixture_lines, 6, 'Cursor fixture event count')
+
+local cursor_command_calls = {}
+local cursor_terminal_opens = 0
+local function cursor_command_runner(args)
+  table.insert(cursor_command_calls, table.concat(args, ' '))
+  if args[2] == 'status' then return { code = 0, stdout = 'Logged in' } end
+  if args[2] == '--help' then return { code = 0, stdout = '--output-format text | json | stream-json' } end
+  return { code = 1, stderr = 'unexpected command' }
+end
+
+local cursor_pipes = {}
+local cursor_spawn
+local fake_cursor_uv = {}
+function fake_cursor_uv.new_pipe()
+  local pipe = { closing = false }
+  function pipe:is_closing() return self.closing end
+  function pipe:close() self.closing = true end
+  table.insert(cursor_pipes, pipe)
+  return pipe
+end
+function fake_cursor_uv.cwd() return '/workspace' end
+function fake_cursor_uv.read_start(pipe, callback) pipe.reader = callback end
+function fake_cursor_uv.spawn(executable, options, on_exit)
+  cursor_spawn = { executable = executable, options = options, on_exit = on_exit }
+  local process = { closing = false }
+  function process:is_closing() return self.closing end
+  function process:close() self.closing = true end
+  function process:kill() self.closing = true; on_exit(0) end
+  return process
+end
+
+local CursorAdapter = require 'custom.agents.adapters.cursor'
+local cursor_events = {}
+local cursor_adapter = CursorAdapter.new {
+  provider = providers.cursor,
+  uv = fake_cursor_uv,
+  command_runner = cursor_command_runner,
+  json_decode = decode_cursor_json,
+  schedule = function(callback) callback() end,
+  notify = function() end,
+  open_terminal = function() cursor_terminal_opens = cursor_terminal_opens + 1; return true end,
+  levels = { WARN = 'WARN' },
+}
+local expected_cursor_kinds = { 'started', 'text_delta', 'tool_started', 'tool_output', 'completed', 'error' }
+for index, line in ipairs(cursor_fixture_lines) do
+  local normalized = cursor_adapter:parse_event(decode_cursor_json(line))
+  assert(normalized, 'Cursor fixture event ' .. index .. ' is normalized')
+  assert_equal(normalized.kind, expected_cursor_kinds[index], 'Cursor fixture event kind ' .. index)
+end
+assert_equal(cursor_adapter:parse_event { type = 'thinking', subtype = 'delta' }, nil, 'Cursor thinking is ignored')
+
+local cursor_started, cursor_start_error = cursor_adapter:start()
+assert_equal(cursor_started, true, 'authenticated Cursor starts')
+assert_equal(cursor_start_error, nil, 'authenticated Cursor start reason')
+assert_equal(cursor_command_calls[1], 'cursor-agent status', 'Cursor auth is checked once before startup')
+assert_equal(cursor_command_calls[2], 'cursor-agent --help', 'Cursor stream-json support is checked once')
+local cursor_capabilities = cursor_adapter:capabilities()
+assert_equal(cursor_capabilities.protocol, 'stream-json', 'Cursor reports stream-json protocol')
+assert_equal(cursor_capabilities.fallback_protocol, 'terminal', 'Cursor reports terminal fallback')
+
+cursor_adapter:prompt('--not-a-Cursor-option', function(event) table.insert(cursor_events, event) end)
+assert_equal(cursor_spawn.executable, 'cursor-agent', 'Cursor executable')
+assert_equal(
+  table.concat(cursor_spawn.options.args, ' '),
+  '--print --output-format stream-json --stream-partial-output --mode ask -- --not-a-Cursor-option',
+  'Cursor separates prompt text from options without shell interpolation'
+)
+cursor_pipes[1].reader(nil, cursor_fixture_lines[1] .. '\n' .. cursor_fixture_lines[2] .. '\n')
+assert_equal(cursor_events[1].kind, 'started', 'Cursor stream emits normalized lifecycle events')
+assert_equal(cursor_events[2].payload.text, 'cursor fixture ready', 'Cursor stream emits normalized text')
+cursor_spawn.on_exit(0)
+cursor_pipes[2].reader(nil, nil)
+cursor_pipes[1].reader(nil, cursor_fixture_lines[5])
+cursor_pipes[1].reader(nil, nil)
+assert_equal(cursor_events[3].kind, 'completed', 'Cursor flushes final unterminated JSONL event')
+assert_equal(cursor_terminal_opens, 0, 'compatible stream-json does not open terminal fallback')
+
+local cursor_auth_checks = 0
+local cursor_unauthenticated = CursorAdapter.new {
+  provider = providers.cursor,
+  uv = fake_cursor_uv,
+  command_runner = function()
+    cursor_auth_checks = cursor_auth_checks + 1
+    return { code = 1, stderr = 'Not logged in' }
+  end,
+  open_terminal = function() cursor_terminal_opens = cursor_terminal_opens + 1; return true end,
+}
+local cursor_auth_started, cursor_auth_error = cursor_unauthenticated:start()
+assert_equal(cursor_auth_started, false, 'unauthenticated Cursor fails startup')
+assert(cursor_auth_error:find('cursor%-agent login'), 'unauthenticated Cursor gives login remedy')
+assert_equal(cursor_auth_checks, 1, 'unauthenticated Cursor does not retry or probe the protocol')
+assert_equal(cursor_terminal_opens, 0, 'unauthenticated Cursor does not enter a fallback loop')
+
+local fallback_opens = 0
+local cursor_fallback = CursorAdapter.new {
+  provider = providers.cursor,
+  uv = fake_cursor_uv,
+  command_runner = function(args)
+    if args[2] == 'status' then return { code = 0 } end
+    return { code = 0, stdout = '--output-format text | json' }
+  end,
+  open_terminal = function(name)
+    assert_equal(name, 'cursor', 'Cursor fallback provider')
+    fallback_opens = fallback_opens + 1
+    return true
+  end,
+}
+assert_equal(cursor_fallback:start(), true, 'Cursor falls back when stream-json is incompatible')
+assert_equal(cursor_fallback:capabilities().protocol, 'terminal', 'Cursor fallback reports terminal protocol')
+assert_equal(fallback_opens, 1, 'Cursor incompatible protocol opens ToggleTerm once')
+cursor_fallback:prompt('not retried', function(event) table.insert(cursor_events, event) end)
+assert_equal(fallback_opens, 1, 'Cursor prompt does not retry terminal fallback')
+assert_equal(cursor_events[#cursor_events].kind, 'error', 'terminal fallback reports structured prompt unavailability')
 
 assert_equal(config.set_active('cursor'), true, 'persisting a known active agent')
 assert_equal(config.active(), 'cursor', 'persisted active agent')
@@ -776,6 +917,8 @@ end
 fake_uv.spawn = successful_spawn
 
 package.loaded['custom.agents.adapters.pi'] = nil
+package.loaded['custom.agents.adapters.cursor'] = nil
+package.loaded['custom.agents.adapters.codex'] = nil
 
 local adapter_calls = {}
 local adapter_factories = { pi = 0, cursor = 0, codex = 0 }
