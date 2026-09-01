@@ -101,6 +101,9 @@ assert_equal(providers.cursor.command[1], 'cursor-agent', 'Cursor executable')
 assert_equal(providers.cursor.protocol, 'stream-json', 'Cursor protocol')
 assert_equal(providers.codex.command[1], 'codex', 'Codex executable')
 assert_equal(providers.codex.protocol, 'app-server', 'Codex protocol')
+assert_equal(providers.codex.fallback_protocol, 'exec-json', 'Codex fallback protocol')
+assert_equal(providers.codex.sandbox, 'read-only', 'Codex safe sandbox default')
+assert_equal(providers.codex.approval_policy, 'on-request', 'Codex approval default')
 assert_equal(#providers.pi.terminal_args, 0, 'Pi terminal args')
 assert_equal(#providers.cursor.terminal_args, 0, 'Cursor terminal args')
 assert_equal(#providers.codex.terminal_args, 0, 'Codex terminal args')
@@ -136,6 +139,152 @@ end
 
 local ok = pcall(events.new, 'unknown_event', {})
 assert_equal(ok, false, 'unknown event kinds are rejected')
+
+local function decode_codex_json(value)
+  local event_type = assert(value:match '"type":"([^"]+)"', 'missing Codex fixture event type')
+  local result = {
+    type = event_type,
+    thread_id = value:match '"thread_id":"([^"]+)"',
+    turn_id = value:match '"turn_id":"([^"]+)"',
+    id = value:match '^.-"id":"([^"]+)"',
+    command = value:match '^.-"command":"([^"]+)"',
+  }
+  local item_type = value:match '"item":.-"type":"([^"]+)"'
+  if item_type then
+    result.item = {
+      id = value:match '"item":.-"id":"([^"]+)"',
+      type = item_type,
+      command = value:match '"item":.-"command":"([^"]+)"',
+      delta = value:match '"delta":"([^"]*)"',
+      text = value:match '"text":"([^"]*)"',
+      aggregated_output = value:match '"aggregated_output":"([^"]*)"',
+    }
+    if result.item.aggregated_output then
+      result.item.aggregated_output = result.item.aggregated_output:gsub('\\n', '\n')
+    end
+  end
+  local error_message = value:match '"error":.-"message":"([^"]+)"'
+  if error_message then result.error = { message = error_message } end
+  return result
+end
+
+local codex_fixture_lines = {}
+for line in assert(io.lines 'tests/fixtures/codex-events.jsonl') do
+  table.insert(codex_fixture_lines, line)
+end
+assert_equal(#codex_fixture_lines, 9, 'Codex fixture event count')
+
+local codex_command_calls = {}
+local function codex_command_runner(args)
+  table.insert(codex_command_calls, table.concat(args, ' '))
+  if args[2] == 'login' then return { code = 0, stdout = 'Logged in' } end
+  if args[2] == 'app-server' then return { code = 0, stdout = 'Usage: codex app-server' } end
+  return { code = 1, stderr = 'unexpected command' }
+end
+
+local codex_pipes = {}
+local codex_spawn
+local fake_codex_uv = {}
+function fake_codex_uv.new_pipe()
+  local pipe = { writes = {}, closing = false }
+  function pipe:is_closing() return self.closing end
+  function pipe:close() self.closing = true end
+  function pipe:write(value, callback)
+    table.insert(self.writes, value)
+    if callback then callback(nil) end
+  end
+  table.insert(codex_pipes, pipe)
+  return pipe
+end
+function fake_codex_uv.cwd() return '/workspace' end
+function fake_codex_uv.read_start(pipe, callback) pipe.reader = callback end
+function fake_codex_uv.spawn(executable, options, on_exit)
+  codex_spawn = { executable = executable, options = options, on_exit = on_exit }
+  local process = { closing = false }
+  function process:is_closing() return self.closing end
+  function process:close() self.closing = true end
+  function process:kill() self.closing = true; on_exit(0) end
+  return process
+end
+
+local CodexAdapter = require 'custom.agents.adapters.codex'
+local codex_events = {}
+local codex_adapter = CodexAdapter.new {
+  provider = providers.codex,
+  uv = fake_codex_uv,
+  command_runner = codex_command_runner,
+  json_decode = decode_codex_json,
+  schedule = function(callback) callback() end,
+  notify = function() end,
+  levels = { ERROR = 'ERROR', WARN = 'WARN' },
+}
+local expected_codex_kinds = {
+  'started', 'started', 'text_delta', 'text_delta', 'tool_started',
+  'tool_output', 'approval_required', 'completed', 'error',
+}
+for index, line in ipairs(codex_fixture_lines) do
+  local normalized = codex_adapter:parse_event(decode_codex_json(line))
+  assert(normalized, 'Codex fixture event ' .. index .. ' is normalized')
+  assert_equal(normalized.kind, expected_codex_kinds[index], 'Codex fixture event kind ' .. index)
+end
+assert_equal(codex_adapter:parse_event { type = 'unknown' }, nil, 'unknown Codex events are ignored')
+
+local codex_started, codex_start_error = codex_adapter:start()
+assert_equal(codex_started, true, 'authenticated Codex starts')
+assert_equal(codex_start_error, nil, 'authenticated Codex start reason')
+assert_equal(codex_command_calls[1], 'codex login status', 'Codex auth is checked once before startup')
+assert_equal(codex_command_calls[2], 'codex app-server --help', 'Codex app-server is preferred when available')
+local codex_capabilities = codex_adapter:capabilities()
+assert_equal(codex_capabilities.protocol, 'app-server', 'Codex selects app-server')
+assert_equal(codex_capabilities.fallback_protocol, 'exec-json', 'Codex retains exec JSON fallback')
+assert_equal(codex_capabilities.sandbox, 'read-only', 'Codex capability exposes sandbox')
+assert_equal(codex_capabilities.approval_policy, 'on-request', 'Codex capability exposes approval policy')
+
+codex_adapter:prompt('hello Codex', function(event) table.insert(codex_events, event) end)
+assert_equal(codex_spawn.executable, 'codex', 'Codex exec executable')
+assert_equal(
+  table.concat(codex_spawn.options.args, ' '),
+  'exec --json --sandbox read-only -c approval_policy="on-request" -',
+  'Codex exec fallback keeps safe noninteractive arguments'
+)
+assert_equal(codex_pipes[1].writes[1], 'hello Codex', 'Codex prompt is written without shell interpolation')
+codex_pipes[2].reader(nil, codex_fixture_lines[1] .. '\n' .. codex_fixture_lines[3] .. '\n')
+assert_equal(codex_events[1].kind, 'started', 'Codex JSONL stream emits normalized lifecycle events')
+assert_equal(codex_events[2].payload.text, 'Hello ', 'Codex JSONL stream emits normalized text')
+codex_adapter:stop()
+
+local fallback_adapter = CodexAdapter.new {
+  provider = providers.codex,
+  uv = fake_codex_uv,
+  command_runner = function(args)
+    if args[2] == 'login' then return { code = 0 } end
+    return { code = 2, stderr = 'unknown subcommand app-server' }
+  end,
+  json_decode = decode_codex_json,
+  schedule = function(callback) callback() end,
+  notify = function() end,
+  levels = {},
+}
+assert_equal(fallback_adapter:start(), true, 'Codex starts when app-server is absent')
+assert_equal(fallback_adapter:capabilities().protocol, 'exec-json', 'Codex falls back to exec JSON')
+
+local auth_checks = 0
+local unauthenticated_adapter = CodexAdapter.new {
+  provider = providers.codex,
+  uv = fake_codex_uv,
+  command_runner = function()
+    auth_checks = auth_checks + 1
+    return { code = 1, stderr = 'Not logged in' }
+  end,
+  json_decode = decode_codex_json,
+  schedule = function(callback) callback() end,
+  notify = function() end,
+  levels = {},
+}
+local auth_started, auth_error = unauthenticated_adapter:start()
+assert_equal(auth_started, false, 'unauthenticated Codex fails startup')
+assert(auth_error:find('codex login', 1, true), 'unauthenticated Codex gives login remedy')
+assert_equal(auth_checks, 1, 'unauthenticated Codex does not retry')
 
 assert_equal(config.set_active('cursor'), true, 'persisting a known active agent')
 assert_equal(config.active(), 'cursor', 'persisted active agent')

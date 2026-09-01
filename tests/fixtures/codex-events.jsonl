@@ -1,0 +1,9 @@
+{"type":"thread.started","thread_id":"thread-1"}
+{"type":"turn.started","turn_id":"turn-1"}
+{"type":"item.updated","item":{"id":"message-1","type":"agent_message","delta":"Hello "}}
+{"type":"item.completed","item":{"id":"message-1","type":"agent_message","text":"world"}}
+{"type":"item.started","item":{"id":"tool-1","type":"command_execution","command":"pwd"}}
+{"type":"item.updated","item":{"id":"tool-1","type":"command_execution","aggregated_output":"/workspace\n"}}
+{"type":"approval.requested","id":"approval-1","command":"rm generated.txt"}
+{"type":"turn.completed","turn_id":"turn-1"}
+{"type":"turn.failed","turn_id":"turn-2","error":{"message":"model unavailable"}}
