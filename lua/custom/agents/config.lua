@@ -41,6 +41,11 @@ local function normalize(value)
     end
   end
 
+  if not result.agents[result.active_agent].enabled then
+    result.agents.pi.enabled = true
+    result.active_agent = 'pi'
+  end
+
   return result
 end
 

@@ -153,6 +153,18 @@ assert_equal(config.save {
 }, true, 'saving a disabled requested active agent')
 assert_equal(config.active(), 'pi', 'save falls back from a disabled requested active agent')
 
+assert_equal(config.save {
+  active_agent = 'cursor',
+  agents = {
+    pi = { enabled = false },
+    cursor = { enabled = false },
+    codex = { enabled = false },
+  },
+}, true, 'saving an all-disabled configuration')
+local normalized_saved_all_disabled = config.load()
+assert_equal(normalized_saved_all_disabled.active_agent, 'pi', 'all-disabled save selects Pi fallback')
+assert(normalized_saved_all_disabled.agents.pi.enabled == true, 'all-disabled save enables Pi fallback')
+
 local config_path = temp_data .. '/agent_harness.json'
 local invalid_config = assert(io.open(config_path, 'wb'))
 invalid_config:write '{"active_agent":"pi","agents":{"pi":{"enabled":false},"cursor":{"enabled":true},"codex":{"enabled":true}}}\n'
@@ -160,6 +172,13 @@ invalid_config:close()
 local normalized_persisted_config = config.load()
 assert_equal(normalized_persisted_config.active_agent, 'cursor', 'load falls back from a persisted disabled active agent')
 assert_equal(normalized_persisted_config.agents.pi.enabled, false, 'load preserves normalized provider enablement')
+
+invalid_config = assert(io.open(config_path, 'wb'))
+invalid_config:write '{"active_agent":"codex","agents":{"pi":{"enabled":false},"cursor":{"enabled":false},"codex":{"enabled":false}}}\n'
+invalid_config:close()
+local normalized_persisted_all_disabled = config.load()
+assert_equal(normalized_persisted_all_disabled.active_agent, 'pi', 'all-disabled persisted config selects Pi fallback')
+assert(normalized_persisted_all_disabled.agents.pi.enabled == true, 'all-disabled persisted config enables Pi fallback')
 
 assert_equal(config.save(config_with_secrets), true, 'restoring sanitized harness configuration')
 local config_file = assert(io.open(config_path, 'rb'))
