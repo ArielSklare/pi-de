@@ -5,6 +5,7 @@ local M = {}
 
 local active_name = config.active()
 local active_adapter
+local adapters = {}
 local state = 'stopped'
 
 local auth_remedies = {
@@ -58,8 +59,11 @@ local function create_adapter(name)
 end
 
 local function adapter_for(name)
-  if name == active_name and active_adapter then return active_adapter, nil end
-  return create_adapter(name)
+  if adapters[name] then return adapters[name], nil end
+
+  local adapter, reason = create_adapter(name)
+  if adapter then adapters[name] = adapter end
+  return adapter, reason
 end
 
 local function get_active_adapter()
@@ -159,7 +163,7 @@ function M.select(name)
     local available
     available, reason = check_available(name)
     if not available then return false, reason end
-    next_adapter, reason = create_adapter(name)
+    next_adapter, reason = adapter_for(name)
     if not next_adapter then
       notify_error(reason)
       return false, reason
@@ -175,7 +179,7 @@ function M.select(name)
   if not persisted then return false, reason end
 
   active_name = name
-  active_adapter = next_adapter
+  active_adapter = next_adapter or adapters[name]
 
   if needs_stop then return M.start() end
   return true, nil

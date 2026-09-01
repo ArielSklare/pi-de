@@ -433,7 +433,8 @@ local adapter_calls = {}
 local adapter_factories = { pi = 0, cursor = 0, codex = 0 }
 local adapter_behavior = {}
 local function fake_adapter(name)
-  local adapter = {
+  local adapter
+  adapter = {
     start = function()
       table.insert(adapter_calls, name .. ':start')
       if adapter_behavior[name] and adapter_behavior[name].start then
@@ -460,14 +461,21 @@ local function fake_adapter(name)
     end,
     _apply_suggested_edit = function(_, bufnr, edit, callback)
       table.insert(adapter_calls, ('%s:apply:%d:%s'):format(name, bufnr, edit.newText))
+      adapter.pending_suggestions = (adapter.pending_suggestions or 0) + 1
       if callback then callback(true) end
     end,
     suggest_edits = function(_, bufnr, start_line, end_line, callback)
       table.insert(adapter_calls, ('%s:suggest:%d:%d:%d'):format(name, bufnr, start_line, end_line))
       if callback then callback(true) end
     end,
-    accept_suggestions = function() table.insert(adapter_calls, name .. ':accept') end,
-    discard_suggestions = function() table.insert(adapter_calls, name .. ':discard') end,
+    accept_suggestions = function()
+      table.insert(adapter_calls, name .. ':accept:' .. tostring(adapter.pending_suggestions or 0))
+      adapter.pending_suggestions = 0
+    end,
+    discard_suggestions = function()
+      table.insert(adapter_calls, name .. ':discard:' .. tostring(adapter.pending_suggestions or 0))
+      adapter.pending_suggestions = 0
+    end,
     capabilities = function() return { provider = name, prompt = true } end,
   }
   return adapter
@@ -607,7 +615,9 @@ package.loaded['custom.agents.manager'] = nil
 package.loaded['custom.plugins.pi'] = nil
 manager = require 'custom.agents.manager'
 local pi_factories_before_facade = adapter_factories.pi
-vim.fn.executable = function(command) return command == 'pi' and 1 or 0 end
+vim.fn.executable = function(command)
+  return (command == 'pi' or command == 'cursor-agent' or command == 'codex') and 1 or 0
+end
 original_api = vim.api
 local compatibility_commands = {}
 vim.api = setmetatable({
@@ -625,8 +635,13 @@ compatibility_commands.PiStart()
 pi_facade.pi_request('status', { value = 'one' }, function() end)
 pi_facade.apply_suggested_edit(9, { newText = 'replacement' }, function() end)
 compatibility_commands.PiSuggest { range = 1, line1 = 3, line2 = 5, buf = 9 }
-compatibility_commands.PiAccept()
+assert_equal(manager.select('cursor'), true, 'switches away with a pending Pi suggestion')
 compatibility_commands.PiDiscard()
+assert(pi_facade.adapter() == facade_adapter, 'Pi discard reuses the adapter that owns pending suggestion originals')
+pi_facade.apply_suggested_edit(9, { newText = 'second replacement' }, function() end)
+assert_equal(manager.select('cursor'), true, 'switches away with another pending Pi suggestion')
+compatibility_commands.PiAccept()
+assert(pi_facade.adapter() == facade_adapter, 'Pi accept reuses the adapter that owns pending suggestion highlights')
 compatibility_commands.PiStop()
 local facade_calls = {}
 for index = facade_calls_start + 1, #adapter_calls do table.insert(facade_calls, adapter_calls[index]) end
@@ -635,10 +650,19 @@ assert_equal(table.concat(facade_calls, ','), table.concat({
   'pi:request:status:one',
   'pi:apply:9:replacement',
   'pi:suggest:9:2:5',
-  'pi:accept',
-  'pi:discard',
   'pi:stop',
-}, ','), 'all Pi commands and wrappers share the manager lifecycle and adapter')
+  'cursor:start',
+  'cursor:stop',
+  'pi:start',
+  'pi:discard:1',
+  'pi:apply:9:second replacement',
+  'pi:stop',
+  'cursor:start',
+  'cursor:stop',
+  'pi:start',
+  'pi:accept:1',
+  'pi:stop',
+}, ','), 'Pi pending suggestions survive provider switching on the shared adapter')
 assert_equal(adapter_factories.pi, pi_factories_before_facade + 1, 'Pi facade operations do not construct a second adapter')
 vim.api = original_api
 vim.fn.executable = original_executable
