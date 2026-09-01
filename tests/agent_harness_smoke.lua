@@ -80,7 +80,7 @@ if is_nvim then vim.fn.mkdir(temp_data, 'p') end
 
 local function assert_equal(actual, expected, message)
   if actual ~= expected then
-    error(('%s: expected %q, got %q'):format(message, expected, actual), 2)
+    error(('%s: expected %s, got %s'):format(message, tostring(expected), tostring(actual)), 2)
   end
 end
 
@@ -214,6 +214,129 @@ vim.env = original_env
 vim.schedule = original_schedule
 vim.list_extend = original_list_extend
 vim.fn.expand = original_expand
+
+local created_terminals = {}
+package.preload['custom.plugins.setup'] = function()
+  return { get_pi_command = function() return { 'pi', '--model', 'model with space' } end }
+end
+package.preload['toggleterm.terminal'] = function()
+  local Terminal = {}
+  function Terminal:new(options)
+    local instance = { options = options, toggles = 0 }
+    function instance:toggle() self.toggles = self.toggles + 1 end
+    table.insert(created_terminals, instance)
+    return instance
+  end
+  return { Terminal = Terminal }
+end
+local original_shellescape = vim.fn.shellescape
+vim.fn.shellescape = function(value) return "'" .. value .. "'" end
+package.loaded['custom.agents.terminal'] = nil
+local terminal = require 'custom.agents.terminal'
+local terminal_opened, terminal_error = terminal.open 'pi'
+assert_equal(terminal_opened, true, 'opening the Pi terminal: ' .. tostring(terminal_error))
+assert_equal(created_terminals[1].options.cmd, "'pi' '--model' 'model with space'", 'Pi terminal command construction')
+assert_equal(created_terminals[1].options.display_name, 'Pi', 'Pi terminal display name')
+assert_equal(terminal.open('cursor'), true, 'opening the Cursor terminal')
+assert_equal(created_terminals[2].options.cmd, "'cursor-agent'", 'Cursor terminal command construction')
+assert_equal(created_terminals[2].options.display_name, 'Cursor Agent', 'Cursor terminal display name')
+assert_equal(terminal.open('codex'), true, 'opening the Codex terminal')
+assert_equal(created_terminals[3].options.cmd, "'codex'", 'Codex terminal command construction')
+assert_equal(created_terminals[3].options.display_name, 'Codex', 'Codex terminal display name')
+assert_equal(terminal.open('pi'), true, 'reopening the Pi terminal')
+assert_equal(#created_terminals, 3, 'one ToggleTerm instance per provider')
+local opened, open_error = terminal.open 'missing'
+assert_equal(opened, false, 'unknown terminal provider is rejected')
+assert(type(open_error) == 'string' and open_error:find('Unknown', 1, true), 'unknown terminal provider reason')
+assert_equal(config.set_active('cursor'), true, 'selecting Cursor for active terminal routing')
+terminal.toggle_active()
+assert_equal(created_terminals[2].toggles, 2, 'active terminal routes to Cursor')
+assert_equal(config.set_active('pi'), true, 'restoring Pi after terminal routing')
+vim.fn.shellescape = original_shellescape
+package.loaded['custom.agents.terminal'] = nil
+package.loaded['custom.plugins.setup'] = nil
+package.loaded['toggleterm.terminal'] = nil
+package.preload['custom.plugins.setup'] = nil
+package.preload['toggleterm.terminal'] = nil
+
+local command_calls = {}
+local command_manager = {
+  select = function(name) table.insert(command_calls, 'select:' .. name); return true end,
+  start = function() table.insert(command_calls, 'start'); return true end,
+  stop = function() table.insert(command_calls, 'stop'); return true end,
+  toggle_terminal = function() table.insert(command_calls, 'toggle') end,
+}
+package.preload['custom.agents.manager'] = function() return command_manager end
+local original_fs = vim.fs
+local original_ui = vim.ui
+local original_keymap = vim.keymap
+local command_original_stdpath = vim.fn.stdpath
+original_api = vim.api
+local registered_commands = {}
+vim.fs = {
+  joinpath = function(...) return table.concat({ ... }, '/') end,
+  dir = function() return function() return nil end end,
+}
+vim.api = { nvim_create_user_command = function(name, callback) registered_commands[name] = callback end }
+vim.fn.stdpath = function() return '/tmp' end
+vim.ui = {
+  select = function(items, options, callback)
+    assert_equal(table.concat(items, ','), 'pi,cursor,codex', 'agent selection options')
+    assert_equal(options.format_item('cursor'), 'Cursor Agent', 'agent selection display name')
+    callback('cursor')
+  end,
+}
+package.loaded['custom.plugins.init'] = nil
+require 'custom.plugins.init'
+registered_commands.AgentSelect()
+registered_commands.AgentStart()
+registered_commands.AgentStop()
+registered_commands.AgentToggle()
+assert_equal(table.concat(command_calls, ','), 'select:cursor,start,stop,toggle', 'agent command routing')
+package.loaded['custom.plugins.init'] = nil
+package.loaded['custom.agents.manager'] = nil
+package.preload['custom.agents.manager'] = nil
+vim.fs = original_fs
+vim.api = original_api
+vim.fn.stdpath = command_original_stdpath
+vim.ui = original_ui
+vim.keymap = original_keymap
+
+local plugin_terminal_calls = {}
+package.preload['custom.agents.terminal'] = function()
+  return {
+    open = function(name) table.insert(plugin_terminal_calls, 'open:' .. name); return true end,
+    toggle_active = function() table.insert(plugin_terminal_calls, 'toggle') end,
+  }
+end
+local original_pack = vim.pack
+local original_version = vim.version
+local original_o = vim.o
+original_keymap = vim.keymap
+local configured_toggleterm
+local terminal_keymaps = {}
+vim.pack = { add = function() end }
+vim.version = { range = function() return '*' end }
+vim.o = { lines = 40, columns = 120, shell = '/bin/sh' }
+vim.keymap = { set = function(_, lhs, callback) terminal_keymaps[lhs] = callback end }
+package.preload.toggleterm = function()
+  return { setup = function(options) configured_toggleterm = options end }
+end
+package.loaded['custom.plugins.toggleterm'] = nil
+require 'custom.plugins.toggleterm'
+assert(configured_toggleterm, 'ToggleTerm is configured')
+terminal_keymaps['<leader>tp']()
+terminal_keymaps['<leader>ta']()
+assert_equal(table.concat(plugin_terminal_calls, ','), 'open:pi,toggle', 'agent terminal keymap routing')
+package.loaded['custom.plugins.toggleterm'] = nil
+package.loaded['custom.agents.terminal'] = nil
+package.loaded.toggleterm = nil
+package.preload['custom.agents.terminal'] = nil
+package.preload.toggleterm = nil
+vim.pack = original_pack
+vim.version = original_version
+vim.o = original_o
+vim.keymap = original_keymap
 
 local function decode_json_string(value)
   local result = {}
