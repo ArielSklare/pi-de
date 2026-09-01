@@ -37,9 +37,9 @@ function CodexAdapter.new(options)
     executable = command[1] or 'codex',
     sandbox = options.sandbox or provider.sandbox or 'read-only',
     approval_policy = options.approval_policy or provider.approval_policy or 'on-request',
-    preferred_protocol = provider.protocol or 'app-server',
+    preferred_protocol = provider.preferred_protocol or 'app-server',
     fallback_protocol = provider.fallback_protocol or 'exec-json',
-    protocol = provider.fallback_protocol or 'exec-json',
+    protocol = provider.protocol or provider.fallback_protocol or 'exec-json',
     uv = options.uv or vim.uv or vim.loop,
     command_runner = options.command_runner or default_command_runner,
     json_decode = options.json_decode or vim.json.decode,
@@ -47,7 +47,6 @@ function CodexAdapter.new(options)
     notify = options.notify or vim.notify,
     levels = options.levels or (vim.log and vim.log.levels) or {},
     auth_timeout = options.auth_timeout or 2000,
-    probe_timeout = options.probe_timeout or 2000,
     started = false,
     process = nil,
     stdin = nil,
@@ -57,6 +56,11 @@ function CodexAdapter.new(options)
     stderr_buffer = '',
     callback = nil,
     stopping = false,
+    process_exited = false,
+    stdout_eof = false,
+    stderr_eof = false,
+    exit_code = nil,
+    error_emitted = false,
   }, CodexAdapter)
 end
 
@@ -73,13 +77,12 @@ function CodexAdapter:start()
 
   local auth = self:_run({ 'login', 'status' }, self.auth_timeout)
   if auth.code ~= 0 then
-    local reason = "Codex is not authenticated; run 'codex login'"
-    self.notify(reason, self.levels.ERROR)
-    return false, reason
+    return false, "Codex is not authenticated; run 'codex login'"
   end
 
-  local probe = self:_run({ 'app-server', '--help' }, self.probe_timeout)
-  self.protocol = probe.code == 0 and self.preferred_protocol or self.fallback_protocol
+  -- app-server transport is planned but not implemented; report the transport
+  -- that prompt() actually uses rather than capability-probing an inactive path.
+  self.protocol = self.fallback_protocol
   self.started = true
   return true, nil
 end
@@ -149,34 +152,93 @@ function CodexAdapter:parse_event(value)
 end
 
 function CodexAdapter:_emit(event)
-  if event and self.callback then
-    local callback = self.callback
-    self.schedule(function() callback(event) end)
+  if not event or not self.callback then return end
+  if event.kind == 'error' then
+    if self.error_emitted then return end
+    self.error_emitted = true
   end
+  local callback = self.callback
+  self.schedule(function() callback(event) end)
+end
+
+function CodexAdapter:_consume_line(line)
+  line = line:gsub('\r$', '')
+  if line == '' then return end
+  local ok, value = pcall(self.json_decode, line)
+  if ok then
+    self:_emit(self:parse_event(value))
+  else
+    self.notify('Invalid Codex JSONL event', self.levels.WARN)
+  end
+end
+
+function CodexAdapter:_drain_stdout_buffer(flush_final)
+  while true do
+    local newline = self.stdout_buffer:find('\n', 1, true)
+    if not newline then break end
+    local line = self.stdout_buffer:sub(1, newline - 1)
+    self.stdout_buffer = self.stdout_buffer:sub(newline + 1)
+    self:_consume_line(line)
+  end
+  if flush_final and self.stdout_buffer ~= '' then
+    local line = self.stdout_buffer
+    self.stdout_buffer = ''
+    self:_consume_line(line)
+  end
+end
+
+function CodexAdapter:_exit_message()
+  local stderr = self.stderr_buffer:gsub('^%s+', ''):gsub('%s+$', '')
+  local lowered = stderr:lower()
+  if lowered:find('not logged', 1, true) or lowered:find('authentication', 1, true) then
+    return "Codex is not authenticated; run 'codex login'"
+  end
+  return stderr ~= '' and stderr or ('Codex exited with code ' .. tostring(self.exit_code))
+end
+
+function CodexAdapter:_maybe_finalize()
+  if not self.process_exited or not self.stdout_eof or not self.stderr_eof then return end
+
+  if self.exit_code ~= 0 and not self.stopping then
+    self:_emit(events.new('error', { provider = 'codex', message = self:_exit_message() }))
+  end
+
+  close_pipe(self.stdin)
+  close_pipe(self.stdout)
+  close_pipe(self.stderr)
+  self.process, self.stdin, self.stdout, self.stderr = nil, nil, nil, nil
+  self.callback = nil
+  self.stopping = false
 end
 
 function CodexAdapter:_consume_stdout(err, data)
   if err then
     self:_emit(events.new('error', { provider = 'codex', message = 'Codex JSONL read failed: ' .. err }))
+  end
+  if data then
+    self.stdout_buffer = self.stdout_buffer .. data
+    self:_drain_stdout_buffer(false)
     return
   end
-  if not data then return end
 
-  self.stdout_buffer = self.stdout_buffer .. data
-  while true do
-    local newline = self.stdout_buffer:find('\n', 1, true)
-    if not newline then break end
-    local line = self.stdout_buffer:sub(1, newline - 1):gsub('\r$', '')
-    self.stdout_buffer = self.stdout_buffer:sub(newline + 1)
-    if line ~= '' then
-      local ok, value = pcall(self.json_decode, line)
-      if ok then
-        self:_emit(self:parse_event(value))
-      else
-        self.notify('Invalid Codex JSONL event', self.levels.WARN)
-      end
-    end
+  self:_drain_stdout_buffer(true)
+  self.stdout_eof = true
+  close_pipe(self.stdout)
+  self:_maybe_finalize()
+end
+
+function CodexAdapter:_consume_stderr(err, data)
+  if err then
+    self:_emit(events.new('error', { provider = 'codex', message = 'Codex stderr read failed: ' .. err }))
   end
+  if data then
+    self.stderr_buffer = self.stderr_buffer .. data
+    return
+  end
+
+  self.stderr_eof = true
+  close_pipe(self.stderr)
+  self:_maybe_finalize()
 end
 
 function CodexAdapter:prompt(text, callback)
@@ -185,7 +247,7 @@ function CodexAdapter:prompt(text, callback)
     if callback then callback(events.new('error', { provider = 'codex', message = reason })) end
     return
   end
-  if self.process and not self.process:is_closing() then
+  if self.process then
     if callback then callback(events.new('error', { provider = 'codex', message = 'Codex is already running a prompt' })) end
     return
   end
@@ -197,6 +259,11 @@ function CodexAdapter:prompt(text, callback)
   self.stderr_buffer = ''
   self.callback = callback
   self.stopping = false
+  self.process_exited = false
+  self.stdout_eof = false
+  self.stderr_eof = false
+  self.exit_code = nil
+  self.error_emitted = false
 
   local arguments = {
     'exec', '--json', '--sandbox', self.sandbox,
@@ -210,24 +277,10 @@ function CodexAdapter:prompt(text, callback)
     stdio = { self.stdin, self.stdout, self.stderr },
   }, function(code)
     close_pipe(self.stdin)
-    close_pipe(self.stdout)
-    close_pipe(self.stderr)
     if process and not process:is_closing() then process:close() end
-    local was_stopping = self.stopping
-    local stderr = self.stderr_buffer
-    self.process, self.stdin, self.stdout, self.stderr = nil, nil, nil, nil
-    self.callback = nil
-    self.stopping = false
-    if code ~= 0 and not was_stopping then
-      local message
-      local lowered = stderr:lower()
-      if lowered:find('not logged', 1, true) or lowered:find('authentication', 1, true) then
-        message = "Codex is not authenticated; run 'codex login'"
-      else
-        message = stderr ~= '' and stderr:gsub('^%s+', ''):gsub('%s+$', '') or ('Codex exited with code ' .. code)
-      end
-      self.notify(message, self.levels.ERROR)
-    end
+    self.exit_code = code
+    self.process_exited = true
+    self:_maybe_finalize()
   end)
 
   if not process then
@@ -236,16 +289,13 @@ function CodexAdapter:prompt(text, callback)
     close_pipe(self.stderr)
     self.stdin, self.stdout, self.stderr, self.callback = nil, nil, nil, nil
     reason = spawn_error or 'executable not found'
-    self.notify('Failed to start Codex: ' .. reason, self.levels.ERROR)
     if callback then callback(events.new('error', { provider = 'codex', message = reason })) end
     return
   end
 
   self.process = process
   self.uv.read_start(self.stdout, function(err, data) self:_consume_stdout(err, data) end)
-  self.uv.read_start(self.stderr, function(_, data)
-    if data then self.stderr_buffer = self.stderr_buffer .. data end
-  end)
+  self.uv.read_start(self.stderr, function(err, data) self:_consume_stderr(err, data) end)
   self.stdin:write(text, function(err)
     if err then self:_emit(events.new('error', { provider = 'codex', message = err })) end
     close_pipe(self.stdin)

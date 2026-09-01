@@ -100,7 +100,8 @@ assert_equal(providers.pi.protocol, 'rpc', 'Pi protocol')
 assert_equal(providers.cursor.command[1], 'cursor-agent', 'Cursor executable')
 assert_equal(providers.cursor.protocol, 'stream-json', 'Cursor protocol')
 assert_equal(providers.codex.command[1], 'codex', 'Codex executable')
-assert_equal(providers.codex.protocol, 'app-server', 'Codex protocol')
+assert_equal(providers.codex.protocol, 'exec-json', 'Codex active protocol')
+assert_equal(providers.codex.preferred_protocol, 'app-server', 'Codex future preferred protocol')
 assert_equal(providers.codex.fallback_protocol, 'exec-json', 'Codex fallback protocol')
 assert_equal(providers.codex.sandbox, 'read-only', 'Codex safe sandbox default')
 assert_equal(providers.codex.approval_policy, 'on-request', 'Codex approval default')
@@ -233,9 +234,10 @@ local codex_started, codex_start_error = codex_adapter:start()
 assert_equal(codex_started, true, 'authenticated Codex starts')
 assert_equal(codex_start_error, nil, 'authenticated Codex start reason')
 assert_equal(codex_command_calls[1], 'codex login status', 'Codex auth is checked once before startup')
-assert_equal(codex_command_calls[2], 'codex app-server --help', 'Codex app-server is preferred when available')
+assert_equal(codex_command_calls[2], nil, 'Codex does not probe an inactive app-server transport')
 local codex_capabilities = codex_adapter:capabilities()
-assert_equal(codex_capabilities.protocol, 'app-server', 'Codex selects app-server')
+assert_equal(codex_capabilities.protocol, 'exec-json', 'Codex reports the active exec JSON transport')
+assert_equal(codex_capabilities.preferred_protocol, 'app-server', 'Codex retains app-server as the future preferred transport')
 assert_equal(codex_capabilities.fallback_protocol, 'exec-json', 'Codex retains exec JSON fallback')
 assert_equal(codex_capabilities.sandbox, 'read-only', 'Codex capability exposes sandbox')
 assert_equal(codex_capabilities.approval_policy, 'on-request', 'Codex capability exposes approval policy')
@@ -251,7 +253,59 @@ assert_equal(codex_pipes[1].writes[1], 'hello Codex', 'Codex prompt is written w
 codex_pipes[2].reader(nil, codex_fixture_lines[1] .. '\n' .. codex_fixture_lines[3] .. '\n')
 assert_equal(codex_events[1].kind, 'started', 'Codex JSONL stream emits normalized lifecycle events')
 assert_equal(codex_events[2].payload.text, 'Hello ', 'Codex JSONL stream emits normalized text')
-codex_adapter:stop()
+codex_pipes[2].reader(nil, codex_fixture_lines[8])
+codex_spawn.on_exit(0)
+assert_equal(#codex_events, 2, 'process exit waits for stdout EOF before finalizing JSONL')
+codex_pipes[3].reader(nil, nil)
+assert_equal(#codex_events, 2, 'stderr EOF alone does not discard buffered stdout')
+codex_pipes[2].reader(nil, nil)
+assert_equal(codex_events[3].kind, 'completed', 'stdout EOF flushes a final unterminated JSONL event')
+assert_equal(codex_adapter.callback, nil, 'Codex clears the callback after process exit and stream EOF')
+
+local runtime_events = {}
+local runtime_notifications = {}
+local runtime_adapter = CodexAdapter.new {
+  provider = providers.codex,
+  uv = fake_codex_uv,
+  command_runner = function() return { code = 0 } end,
+  json_decode = decode_codex_json,
+  schedule = function(callback) callback() end,
+  notify = function(message) table.insert(runtime_notifications, message) end,
+  levels = { ERROR = 'ERROR', WARN = 'WARN' },
+}
+runtime_adapter:prompt('fail once', function(event) table.insert(runtime_events, event) end)
+local runtime_spawn = codex_spawn
+local runtime_stdout, runtime_stderr = codex_pipes[5], codex_pipes[6]
+runtime_spawn.on_exit(17)
+runtime_stderr.reader(nil, 'provider unavailable')
+runtime_stderr.reader(nil, nil)
+assert_equal(#runtime_events, 0, 'nonzero exit waits for stdout EOF before reporting failure')
+runtime_stdout.reader(nil, nil)
+assert_equal(#runtime_events, 1, 'nonzero Codex exit emits one callback event')
+assert_equal(runtime_events[1].kind, 'error', 'nonzero Codex exit emits a normalized error')
+assert_equal(runtime_events[1].payload.message, 'provider unavailable', 'nonzero Codex exit preserves stderr')
+assert_equal(#runtime_notifications, 0, 'runtime failures are callback-owned rather than adapter notifications')
+
+local streamed_error_events = {}
+local streamed_error_adapter = CodexAdapter.new {
+  provider = providers.codex,
+  uv = fake_codex_uv,
+  command_runner = function() return { code = 0 } end,
+  json_decode = decode_codex_json,
+  schedule = function(callback) callback() end,
+  notify = function() end,
+  levels = { ERROR = 'ERROR', WARN = 'WARN' },
+}
+streamed_error_adapter:prompt('streamed failure', function(event) table.insert(streamed_error_events, event) end)
+local streamed_error_spawn = codex_spawn
+local streamed_error_stdout, streamed_error_stderr = codex_pipes[8], codex_pipes[9]
+streamed_error_stdout.reader(nil, codex_fixture_lines[9] .. '\n')
+streamed_error_spawn.on_exit(1)
+streamed_error_stderr.reader(nil, 'duplicate process failure')
+streamed_error_stderr.reader(nil, nil)
+streamed_error_stdout.reader(nil, nil)
+assert_equal(#streamed_error_events, 1, 'streamed and process-exit failures emit exactly one error')
+assert_equal(streamed_error_events[1].kind, 'error', 'the streamed provider error is preserved')
 
 local fallback_adapter = CodexAdapter.new {
   provider = providers.codex,
@@ -269,6 +323,7 @@ assert_equal(fallback_adapter:start(), true, 'Codex starts when app-server is ab
 assert_equal(fallback_adapter:capabilities().protocol, 'exec-json', 'Codex falls back to exec JSON')
 
 local auth_checks = 0
+local auth_notifications = {}
 local unauthenticated_adapter = CodexAdapter.new {
   provider = providers.codex,
   uv = fake_codex_uv,
@@ -278,13 +333,14 @@ local unauthenticated_adapter = CodexAdapter.new {
   end,
   json_decode = decode_codex_json,
   schedule = function(callback) callback() end,
-  notify = function() end,
+  notify = function(message) table.insert(auth_notifications, message) end,
   levels = {},
 }
 local auth_started, auth_error = unauthenticated_adapter:start()
 assert_equal(auth_started, false, 'unauthenticated Codex fails startup')
 assert(auth_error:find('codex login', 1, true), 'unauthenticated Codex gives login remedy')
 assert_equal(auth_checks, 1, 'unauthenticated Codex does not retry')
+assert_equal(#auth_notifications, 0, 'authentication failure notification is manager-owned')
 
 assert_equal(config.set_active('cursor'), true, 'persisting a known active agent')
 assert_equal(config.active(), 'cursor', 'persisted active agent')

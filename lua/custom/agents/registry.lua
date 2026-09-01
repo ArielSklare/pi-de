@@ -14,7 +14,8 @@ local providers = {
   codex = {
     command = { 'codex' },
     terminal_args = {},
-    protocol = 'app-server',
+    protocol = 'exec-json',
+    preferred_protocol = 'app-server',
     fallback_protocol = 'exec-json',
     sandbox = 'read-only',
     approval_policy = 'on-request',
@@ -34,6 +35,7 @@ local function copy_provider(provider)
     command = copy_list(provider.command),
     terminal_args = copy_list(provider.terminal_args),
     protocol = provider.protocol,
+    preferred_protocol = provider.preferred_protocol,
     fallback_protocol = provider.fallback_protocol,
     sandbox = provider.sandbox,
     approval_policy = provider.approval_policy,
