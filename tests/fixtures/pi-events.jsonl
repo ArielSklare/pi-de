@@ -1,0 +1,5 @@
+{"type":"response","id":"1","success":true,"data":{"accepted":true}}
+this is not json
+{"type":"response","id":"2","success":true,"data":{"accepted":true}}
+{"type":"agent_settled"}
+{"type":"response","id":"3","success":true,"data":{"text":"```json\n{\"newText\":\"local value = 2\\nreturn value\\n\"}\n```"}}

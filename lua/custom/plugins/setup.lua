@@ -1,5 +1,6 @@
 -- First-start configuration for the Pi agent integration.
 -- Pi's own auth store (~/.pi/agent/auth.json) is preferred and never copied here.
+-- Optional provider/model overrides are non-secret; credentials remain Pi-owned.
 local uv = vim.uv or vim.loop
 local M = {}
 
@@ -27,49 +28,48 @@ function M.has_base_auth()
   return auth ~= nil and next(auth) ~= nil
 end
 
+local function sanitize_config(config)
+  if type(config) ~= 'table' then return nil end
+  return {
+    auth_source = config.auth_source == 'override' and 'override' or 'pi',
+    provider = type(config.provider) == 'string' and config.provider or nil,
+    model = type(config.model) == 'string' and config.model or nil,
+  }
+end
+
 function M.load_config()
   local config = read_json(config_path)
   if not config then return nil end
 
-  -- Migrate the original setup's empty override to Pi's real auth store.
-  if not config.auth_source and M.has_base_auth() and (not config.api_key or config.api_key == '') then
-    config = { auth_source = 'pi' }
-    M.save_config(config)
-  end
-  return config
+  local sanitized = sanitize_config(config)
+  local needs_migration = config.api_key ~= nil
+    or config.auth_source ~= sanitized.auth_source
+    or config.provider ~= sanitized.provider
+    or config.model ~= sanitized.model
+  if needs_migration then M.save_config(sanitized) end
+  return sanitized
 end
 
 function M.save_config(config)
-  local fd = uv.fs_open(config_path, 'w', 384) -- 0600; API-key overrides must never be world-readable.
+  local sanitized = sanitize_config(config)
+  if not sanitized then return false end
+  local fd = uv.fs_open(config_path, 'w', 384)
   if not fd then return false end
-  local ok = uv.fs_write(fd, vim.json.encode(config), -1)
+  local ok = uv.fs_write(fd, vim.json.encode(sanitized), -1)
   uv.fs_close(fd)
   if not ok then return false end
   uv.fs_chmod(config_path, 384)
   return true
 end
 
-local provider_env = {
-  google = 'GEMINI_API_KEY',
-  openai = 'OPENAI_API_KEY',
-  anthropic = 'ANTHROPIC_API_KEY',
-  azure = 'AZURE_OPENAI_API_KEY',
-  groq = 'GROQ_API_KEY',
-}
-
+-- Retained as a compatibility no-op. Setup must never mutate Neovim's process environment.
 function M.apply_config(config)
-  config = config or M.load_config()
-  if not config or config.auth_source == 'pi' then return end
-  local env_name = provider_env[config.provider]
-  if env_name and config.api_key and config.api_key ~= '' then
-    uv.os_setenv(env_name, config.api_key)
-  end
+  return sanitize_config(config or M.load_config())
 end
 
--- Build a Pi command while leaving credentials in Pi's own auth store or the process environment.
+-- Build a Pi command using only non-secret flags. Pi resolves credentials itself.
 function M.get_pi_command(mode)
   local config = M.load_config()
-  M.apply_config(config)
   local command = { 'pi' }
   if mode then vim.list_extend(command, { '--mode', mode }) end
   if config and config.auth_source ~= 'pi' then
@@ -84,27 +84,22 @@ function M.get_pi_command(mode)
 end
 
 local function save_override()
-  vim.ui.input({ prompt = 'API key (leave empty to use environment): ', default = '' }, function(api_key)
-    if api_key == nil then return end
-    vim.ui.select({ 'google', 'openai', 'anthropic', 'azure', 'groq' }, {
-      prompt = 'Select provider for Pi agent:',
-    }, function(provider)
-      if not provider then return end
-      vim.ui.input({ prompt = 'Model override (optional): ', default = '' }, function(model)
-        if model == nil then return end
-        local config = {
-          auth_source = 'override',
-          api_key = api_key,
-          provider = provider,
-          model = model,
-        }
-        if M.save_config(config) then
-          M.apply_config(config)
-          vim.notify('Pi override configuration saved', vim.log.levels.INFO)
-        else
-          vim.notify('Failed to save Pi configuration', vim.log.levels.ERROR)
-        end
-      end)
+  vim.ui.select({ 'google', 'openai', 'anthropic', 'azure', 'groq' }, {
+    prompt = 'Select provider for Pi agent:',
+  }, function(provider)
+    if not provider then return end
+    vim.ui.input({ prompt = 'Model override (optional): ', default = '' }, function(model)
+      if model == nil then return end
+      local config = {
+        auth_source = 'override',
+        provider = provider,
+        model = model,
+      }
+      if M.save_config(config) then
+        vim.notify('Pi provider/model override saved; authentication remains Pi-owned', vim.log.levels.INFO)
+      else
+        vim.notify('Failed to save Pi configuration', vim.log.levels.ERROR)
+      end
     end)
   end)
 end
@@ -116,7 +111,7 @@ function M.prompt_setup(force)
   if M.has_base_auth() then
     table.insert(options, 'Use existing Pi login (' .. auth_path() .. ')')
   end
-  table.insert(options, 'Configure provider/API key override')
+  table.insert(options, 'Configure provider/model override (use Pi-owned authentication)')
 
   vim.ui.select(options, { prompt = 'Select authentication for embedded Pi:' }, function(choice)
     if not choice then return end

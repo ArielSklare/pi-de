@@ -11,3 +11,27 @@ for file_name, type in vim.fs.dir(plugins_dir, { follow = true }) do
     require('custom.plugins.' .. module)
   end
 end
+
+local manager = require 'custom.agents.manager'
+local provider_names = { 'pi', 'cursor', 'codex' }
+local display_names = { pi = 'Pi', cursor = 'Cursor Agent', codex = 'Codex' }
+
+vim.api.nvim_create_user_command('AgentSelect', function()
+  vim.ui.select(provider_names, {
+    prompt = 'Select active agent:',
+    format_item = function(name) return display_names[name] end,
+  }, function(name)
+    if not name then return end
+    manager.select(name)
+  end)
+end, { desc = 'Select the active agent provider' })
+
+vim.api.nvim_create_user_command('AgentStart', function() manager.start() end, {
+  desc = 'Start the active agent',
+})
+vim.api.nvim_create_user_command('AgentStop', function() manager.stop() end, {
+  desc = 'Stop the active agent',
+})
+vim.api.nvim_create_user_command('AgentToggle', function() manager.toggle_terminal() end, {
+  desc = 'Toggle the active agent terminal',
+})
