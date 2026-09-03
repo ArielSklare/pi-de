@@ -822,7 +822,12 @@ do
   -- require('luasnip.loaders.from_vscode').lazy_load()
 
   -- [[ Autocomplete Engine ]]
-  vim.pack.add { { src = gh 'saghen/blink.cmp', version = vim.version.range '1.*' } }
+  vim.pack.add {
+    { src = gh 'saghen/blink.cmp', version = vim.version.range '1.*' },
+    { src = gh 'saghen/blink.compat', version = vim.version.range '2.*' },
+    gh 'kdheepak/cmp-latex-symbols',
+  }
+  require('blink.compat').setup {}
   require('blink.cmp').setup {
     keymap = {
       -- 'default' (recommended) for mappings similar to built-in completions
@@ -865,7 +870,14 @@ do
     },
 
     sources = {
-      default = { 'lsp', 'path', 'snippets' },
+      default = { 'lsp', 'path', 'snippets', 'latex_symbols' },
+      providers = {
+        latex_symbols = {
+          name = 'latex_symbols',
+          module = 'blink.compat.source',
+          opts = { strategy = 0 },
+        },
+      },
     },
 
     snippets = { preset = 'luasnip' },
